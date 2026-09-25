@@ -6,7 +6,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=150G
-#SBATCH --array=17-24
+#SBATCH --array=11-24
 #SBATCH --mail-user=your.email@institution.org
 #SBATCH --mail-type=END,FAIL
 
@@ -22,7 +22,7 @@ OUTPUT_DIR="/path/to/project/nanoranger_srsf2/output/nanoranger/fastq"
 # Make sure output dir exists
 mkdir -p "$OUTPUT_DIR"
 
-# Format barcode (e.g. 17, 18, ..., 24)
+# Format barcode (e.g. 11, 12, ..., 24)
 BARCODE=$(printf "%02d" ${SLURM_ARRAY_TASK_ID})
 
 # Find the BAM file for this barcode (dorado may prefix the kit name, e.g. SQK-NBD114-24_barcode17.bam)
