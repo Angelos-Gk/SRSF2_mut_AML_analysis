@@ -24,10 +24,10 @@ P3,/path/to/project/output/strelka2/P3_tumor_vs_P3_germ/results/variants/merged_
 P4,/path/to/project/output/strelka2/P4_tumor_vs_P4_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.vcf.gz
 P6,/path/to/project/output/strelka2/P6_tumor_vs_P6_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.vcf.gz
 P7,/path/to/project/output/strelka2/P7_tumor_vs_P7_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.vcf.gz
-P10,/path/to/project/output/strelka2/P10_tumor_vs_P11_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.vcf.gz
-P10_best,/path/to/project/output/strelka2/P10_tumor_vs_P11_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.besteffect.vcf.gz
-P11,/path/to/project/output/strelka2/P11_tumor_vs_P10_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.vcf.gz
-P11_best,/path/to/project/output/strelka2/P11_tumor_vs_P10_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.besteffect.vcf.gz
+P10,/path/to/project/output/strelka2/P10_tumor_vs_P10_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.vcf.gz
+P10_best,/path/to/project/output/strelka2/P10_tumor_vs_P10_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.besteffect.vcf.gz
+P11,/path/to/project/output/strelka2/P11_tumor_vs_P11_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.vcf.gz
+P11_best,/path/to/project/output/strelka2/P11_tumor_vs_P11_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.besteffect.vcf.gz
 P12,/path/to/project/output/strelka2/P12_tumor_vs_P12_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.vcf.gz
 P12_best,/path/to/project/output/strelka2/P12_tumor_vs_P12_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.besteffect.vcf.gz
 P13,/path/to/project/output/strelka2/P13_tumor_vs_P13_germ/results/variants/merged_parsed.pass.dp50.ad5.vaf5.annotated.vcf.gz
