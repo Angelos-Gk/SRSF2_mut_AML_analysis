@@ -2,12 +2,12 @@
 #SBATCH --job-name=wes_alignment
 #SBATCH --error=/path/to/project/logs/preprocessing/wes_alignment_%A_%a.err
 #SBATCH --output=/path/to/project/logs/preprocessing/wes_alignment_%A_%a.out
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --partition=medium
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=180G
-#SBATCH --array=0-32
+#SBATCH --array=0-27
 #SBATCH --mail-user=your.email@institution.org
 #SBATCH --mail-type=END,FAIL
 
