@@ -1,0 +1,57 @@
+setwd("/path/to/project/scripts/")
+
+#Load the necessary libraries
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(tidyr)
+library(SCpubr)
+library(RColorBrewer)
+library(SeuratWrappers)
+library(reticulate)
+library(sceasy)
+library(qs2)
+
+# run scvi
+print("Loading data object")
+obj <- qs_read("../objects/obj_merge_filt_doublets_removed_norm_scaled.qs2")
+print("readRDS:Good")
+top2000 <- head(VariableFeatures(obj), 2000)
+obj.2000 <- obj[top2000]
+print("Variable Features:Good")
+
+use_condaenv("scvi-env", required = TRUE)
+print("conda env:Good")
+sc <- import("scanpy", convert = FALSE)
+print("scanpy:Good")
+scvi <- import("scvi", convert = FALSE)
+print("scvi:Good")
+jax <- import("jax", convert = FALSE)
+print("jax:Good")
+obj.2000[["RNA"]] <- as(object = obj.2000[["RNA"]], Class = "Assay")
+Data <- convertFormat(obj.2000, from = "seurat", to = "anndata", main_layer = "counts", drop_single_values = FALSE)
+print("conversion:Good")
+# Setup model
+scvi$model$SCVI$setup_anndata(Data, batch_key="orig.ident")
+model <- scvi$model$SCVI(Data)
+print("model setup:Good")
+#  model
+model$train(accelerator = 'gpu', devices = 'auto')
+print("model trained:Good")
+latent <- scvi$model$SCVI$get_latent_representation(model)
+x <- as.data.frame(colnames(obj.2000))
+latent_r <- py_to_r(latent)
+latent_df <- as.data.frame(latent_r)
+rownames(latent_df) <- x$`colnames(obj.2000)`
+latent_matrix <- as.matrix(latent_df)
+obj[["scvi"]] <- CreateDimReducObject(embeddings = latent_matrix,
+                                      key = "scvi_", assay = DefaultAssay(obj.2000))
+print("scvi embedding trasfer to original object: Good")
+obj <- FindNeighbors(obj, dims = 1:10, reduction = "scvi")
+print("Find neighbors: Good")
+obj <- FindClusters(obj, resolution = c(0.2,0.5,0.8,1,1.5,2))
+print("Find clusters: Good")
+obj <- RunUMAP(obj, dims = 1:10, reduction = "scvi", n.components = 2)
+print("RUN UMAP: Good")
+qs_save(obj, "../objects/obj_merge_filt_doublets_removed_norm_scaled_scvi.qs2")
+print("save object: Good")
