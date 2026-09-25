@@ -9,9 +9,9 @@
 #SBATCH --mem=128G                    # Memory per node
 #SBATCH --mail-user=your.email@institution.org # Mail to send to
 #SBATCH --mail-type=END,FAIL          # Mail reasons
- 
+
 # Set the data path
 output=/path/to/project/nanoranger_srsf2/output/long_read_preprocessing/basecalled.bam
 demux_dir=/path/to/project/nanoranger_srsf2/output/long_read_preprocessing/demux
- 
+
 dorado demux --output-dir $demux_dir --no-classify $output
