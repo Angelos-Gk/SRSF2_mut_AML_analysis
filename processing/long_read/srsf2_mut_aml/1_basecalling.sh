@@ -17,6 +17,7 @@ CUDA_LAUNCH_BLOCKING=1
 model=/path/to/dorado-0.8.2-linux-x64/models/dna_r10.4.1_e8.2_400bps_sup@v5.0.0
 data=/path/to/project/nanoranger_srsf2/pod5
 output=/path/to/project/nanoranger_srsf2/output/long_read_preprocessing/basecalled.bam
+mkdir -p $(dirname $output)
 
 # Change to the directory containing the data
 cd $data
