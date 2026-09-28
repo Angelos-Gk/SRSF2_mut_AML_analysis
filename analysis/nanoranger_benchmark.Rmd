@@ -1,0 +1,776 @@
+---
+title: "Figure 1 - nanoranger genotyping benchmark (AML1010, AML1026)"
+output: html_document
+---
+
+```{r setup}
+# ============================================================
+# Libraries
+# ============================================================
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(stringr)
+  library(readr)
+  library(ggplot2)
+  library(scales)
+  library(patchwork)
+  library(ggrepel)
+  library(ggh4x)
+  library(cowplot)
+  library(Biostrings)
+  library(qs2)
+})
+
+# ============================================================
+# Paths
+# ============================================================
+PROJECT_DIR    <- "/path/to/project"
+NANORANGER_DIR <- file.path(PROJECT_DIR, "nanoranger")   # panels + mutation files (preprocessing/nanoranger)
+OUT_DIR        <- file.path(PROJECT_DIR, "AML1010_1026")  # benchmark tables + VEP files
+FIG_DIR        <- file.path(OUT_DIR, "plots", "figure1")
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ============================================================
+# Inputs
+#   - Seurat objects: AML1010/AML1026_scrna_preprocessing.R
+#   - benchmark mutation lists: extract_mutations_AML1010/AML1026.R
+# ============================================================
+obj_1010 <- qs2::qs_read(file.path(PROJECT_DIR, "AML1010/objects/obj_1010_with_BoneMarrowMap_Broad_final.qs2"))
+obj_1026 <- qs2::qs_read(file.path(PROJECT_DIR, "AML1026/objects/obj_1026_with_BoneMarrowMap_Broad_final.qs2"))
+
+AML1010_benchmark <- readRDS(file.path(PROJECT_DIR, "AML1010/objects/AML1010_benchmark_mutation_data_list_inSeurat.rds"))
+AML1026_benchmark <- readRDS(file.path(PROJECT_DIR, "AML1026/objects/AML1026_benchmark_mutation_data_list_inSeurat.rds"))
+
+# ============================================================
+# Shared settings
+# ============================================================
+COVERAGE_MIN <- 1   # a cell counts as genotyped for a target with >= 1 read (alt + ref)
+
+# Okabe-Ito (colorblind-safe)
+PROTOCOL_COLORS <- c(
+  rhPCR         = "#0072B2",
+  taqman        = "#E69F00",
+  taqman_biotin = "#009E73"
+)
+```
+
+```{r VEP input}
+# ============================================================
+# Write Ensembl VEP input files from the nanoranger mutation lists.
+# VEP is then run externally (with MANE annotation); its tab-separated
+# output (<patient>_VEP.txt in OUT_DIR) is read in the next chunk.
+# ============================================================
+write_vep_input <- function(mut_path, out_path) {
+  readr::read_csv(mut_path, show_col_types = FALSE) %>%
+    dplyr::transmute(
+      chromosome = sub("^chr", "", chr),
+      start      = as.integer(pos),
+      end        = as.integer(pos),
+      allele     = paste0(ref, "/", alt),
+      strand     = "+",
+      identifier = paste(sample, gene, chr, pos, ref, alt, sep = "_")
+    ) %>%
+    readr::write_tsv(out_path, col_names = FALSE)
+}
+
+write_vep_input(file.path(NANORANGER_DIR, "mutations/mutations.1010.csv"), file.path(OUT_DIR, "AML1010_VEP_input.txt"))
+write_vep_input(file.path(NANORANGER_DIR, "mutations/mutations.1026.csv"), file.path(OUT_DIR, "AML1026_VEP_input.txt"))
+```
+
+```{r benchmark info tables}
+# ============================================================
+# Per-target benchmark table (one row per targeted variant):
+#   VEP MANE_Select annotation, distance to 5' end, transcript length,
+#   genotyped cells + genotyping efficiency per protocol, expression metrics.
+#   Denominator = all cells of the benchmark sample.
+# ============================================================
+build_benchmark_info <- function(obj, benchmark_list, bench_sample, vep_path, mut_path, fasta_path) {
+
+  # ---- benchmark cells (denominator) ----
+  bench_cells <- colnames(obj)[startsWith(colnames(obj), paste0(bench_sample, "_"))]
+  n_bench_cells <- length(bench_cells)
+  stopifnot(n_bench_cells > 0)
+
+  # ---- VEP (MANE_Select) restricted to mutation genes + distance to 5' ----
+  mutations <- readr::read_csv(mut_path, show_col_types = FALSE)
+
+  vep_mane <- readr::read_tsv(vep_path, comment = "##", show_col_types = FALSE) %>%
+    dplyr::filter(MANE == "MANE_Select") %>%
+    dplyr::semi_join(mutations, by = c("SYMBOL" = "gene")) %>%
+    dplyr::mutate(
+      cdna_pos = as.integer(stringr::str_extract(cDNA_position, "^[0-9]+")),
+      distance_to_5p = cdna_pos - 1
+    )
+
+  # ---- transcript length from the panel FASTA ----
+  fasta <- Biostrings::readDNAStringSet(fasta_path)
+
+  fasta_df <- tibble::tibble(
+    fasta_header = stringr::str_trim(names(fasta)),
+    gene = stringr::str_trim(stringr::str_extract(names(fasta), "^[^\\-|]+")),
+    transcript = stringr::str_trim(stringr::str_extract(names(fasta), "ENST[0-9]+\\.[0-9]+")),
+    transcript_length = Biostrings::width(fasta)
+  ) %>%
+    dplyr::distinct(gene, transcript, .keep_all = TRUE)
+
+  vep_mane <- vep_mane %>%
+    dplyr::left_join(fasta_df %>% dplyr::select(transcript, transcript_length),
+                     by = c("Feature" = "transcript"))
+  stopifnot(!any(is.na(vep_mane$transcript_length)))
+
+  # ---- genotyping efficiency (wide; NA -> 0) ----
+  geno_eff_wide <- purrr::imap_dfr(
+    benchmark_list,
+    function(df, gene_name) {
+      df %>%
+        dplyr::mutate(gene = gene_name) %>%
+        dplyr::transmute(
+          bc = as.character(bc),
+          protocol = as.character(protocol),
+          gene = as.character(gene),
+          coverage = as.integer(alt) + as.integer(ref),
+          sample_name = as.character(sample_name)
+        )
+    }
+  ) %>%
+    dplyr::filter(sample_name == bench_sample, bc %in% bench_cells, gene %in% vep_mane$SYMBOL) %>%
+    dplyr::group_by(gene, protocol, bc) %>%
+    dplyr::summarise(coverage = max(coverage, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::mutate(genotyped = coverage >= COVERAGE_MIN) %>%
+    dplyr::group_by(gene, protocol) %>%
+    dplyr::summarise(
+      n_genotyped_cells = sum(genotyped),
+      n_total_cells = n_bench_cells,
+      genotyping_efficiency = n_genotyped_cells / n_total_cells,
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(protocol = make.names(protocol)) %>%
+    tidyr::pivot_wider(
+      id_cols = c(gene, n_total_cells),
+      names_from = protocol,
+      values_from = c(n_genotyped_cells, genotyping_efficiency),
+      names_sep = "_"
+    ) %>%
+    dplyr::mutate(
+      dplyr::across(
+        tidyselect::matches("^n_genotyped_cells_|^genotyping_efficiency_"),
+        ~ tidyr::replace_na(.x, 0)
+      )
+    )
+
+  # ---- expression metrics (mean counts + fraction expressing) ----
+  counts <- Seurat::GetAssayData(obj, assay = "RNA", layer = "counts")
+  expr_df <- tibble::tibble(SYMBOL = unique(vep_mane$SYMBOL)) %>%
+    dplyr::mutate(
+      expr_mean_counts = vapply(SYMBOL, function(g) {
+        if (!g %in% rownames(counts)) return(NA_real_)
+        mean(as.numeric(counts[g, bench_cells, drop = TRUE]))
+      }, numeric(1)),
+      expr_frac_expressing = vapply(SYMBOL, function(g) {
+        if (!g %in% rownames(counts)) return(NA_real_)
+        mean(as.numeric(counts[g, bench_cells, drop = TRUE]) >= 1)
+      }, numeric(1))
+    )
+
+  # ---- final table ----
+  vep_mane %>%
+    dplyr::left_join(geno_eff_wide, by = c("SYMBOL" = "gene")) %>%
+    dplyr::left_join(expr_df, by = "SYMBOL") %>%
+    dplyr::select(
+      `#Uploaded_variation`, Location, Allele, Consequence,
+      SYMBOL, Gene, Feature_type, Feature, BIOTYPE, EXON,
+      cDNA_position, CDS_position, Protein_position, Amino_acids, Codons,
+      Existing_variation, REF_ALLELE, UPLOADED_ALLELE, STRAND,
+      MANE, MANE_SELECT,
+      cdna_pos, distance_to_5p, transcript_length, n_total_cells,
+      n_genotyped_cells_rhPCR, n_genotyped_cells_taqman, n_genotyped_cells_taqman_biotin,
+      genotyping_efficiency_rhPCR, genotyping_efficiency_taqman, genotyping_efficiency_taqman_biotin,
+      expr_mean_counts, expr_frac_expressing
+    )
+}
+
+AML1010_benchmark_info <- build_benchmark_info(
+  obj            = obj_1010,
+  benchmark_list = AML1010_benchmark,
+  bench_sample   = "AML1010.1",
+  vep_path       = file.path(OUT_DIR, "AML1010_VEP.txt"),
+  mut_path       = file.path(NANORANGER_DIR, "mutations/mutations.1010.csv"),
+  fasta_path     = file.path(NANORANGER_DIR, "panel/panel_MT_trns_extended_1010.fa")
+)
+
+AML1026_benchmark_info <- build_benchmark_info(
+  obj            = obj_1026,
+  benchmark_list = AML1026_benchmark,
+  bench_sample   = "AML1026.1",
+  vep_path       = file.path(OUT_DIR, "AML1026_VEP.txt"),
+  mut_path       = file.path(NANORANGER_DIR, "mutations/mutations.1026.csv"),
+  fasta_path     = file.path(NANORANGER_DIR, "panel/panel_MT_trns_extended_1026.fa")
+)
+
+saveRDS(AML1010_benchmark_info, file.path(OUT_DIR, "AML1010_benchmark_info.rds"))
+saveRDS(AML1026_benchmark_info, file.path(OUT_DIR, "AML1026_benchmark_info.rds"))
+```
+
+```{r UMAP schematic}
+# ============================================================
+# AML1010 UMAP, all cells in one color, no labels (schematic panel)
+# ============================================================
+plot <- Seurat::DimPlot(
+  obj_1010,
+  reduction = "umap",
+  cols = "#659ae3",
+  label = FALSE,
+  raster = TRUE
+) +
+  ggplot2::theme_minimal(base_size = 15) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(hjust = 0.5, face = "bold", size = 18),
+    axis.title = ggplot2::element_text(size = 12),
+    axis.line = ggplot2::element_line(arrow = grid::arrow(type = "closed", length = grid::unit(0.15, "inches"))),
+    axis.text = ggplot2::element_blank(),
+    axis.ticks = ggplot2::element_blank(),
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_blank(),
+    legend.position = "none"
+  ) +
+  ggplot2::xlab("UMAP 1") +
+  ggplot2::ylab("UMAP 2")
+
+ggplot2::ggsave(file.path(FIG_DIR, "umap_schematic.pdf"), plot = plot, width = 12, height = 12, dpi = 300)
+```
+
+```{r boxplots genotyped cells and efficiency}
+# ============================================================
+# Two side-by-side boxplots per protocol (8 x 8 cm)
+#   (1) Y = genotyped cells per target
+#   (2) Y = genotyping efficiency per target
+# One point = one (sample, target, protocol)
+# ============================================================
+BOX_PROTOCOL_ORDER <- c("rhPCR", "taqman_biotin", "taqman")
+DOT_SPREAD <- 0.30
+BASE_SIZE  <- 6
+
+# benchmark_info -> long tidy table
+tidy_benchmark_info <- function(info_tbl, sample_label) {
+
+  info_tbl2 <- info_tbl %>%
+    dplyr::mutate(
+      sample = sample_label,
+      gene_symbol = as.character(.data[["SYMBOL"]]),
+      target_id = dplyr::if_else(
+        !is.na(.data[["#Uploaded_variation"]]),
+        as.character(.data[["#Uploaded_variation"]]),
+        as.character(dplyr::row_number())
+      )
+    )
+
+  counts_long <- info_tbl2 %>%
+    tidyr::pivot_longer(
+      cols = dplyr::starts_with("n_genotyped_cells_"),
+      names_to = "protocol",
+      values_to = "n_genotyped",
+      names_prefix = "n_genotyped_cells_"
+    )
+
+  eff_long <- info_tbl2 %>%
+    tidyr::pivot_longer(
+      cols = dplyr::starts_with("genotyping_efficiency_"),
+      names_to = "protocol",
+      values_to = "genotyping_efficiency",
+      names_prefix = "genotyping_efficiency_"
+    ) %>%
+    dplyr::select(sample, target_id, protocol, genotyping_efficiency)
+
+  counts_long %>%
+    dplyr::left_join(eff_long, by = c("sample", "target_id", "protocol")) %>%
+    dplyr::mutate(
+      protocol = factor(protocol, levels = BOX_PROTOCOL_ORDER),
+      gene = gene_symbol
+    ) %>%
+    dplyr::filter(!is.na(protocol)) %>%
+    dplyr::select(sample, target_id, gene, protocol, n_genotyped, genotyping_efficiency)
+}
+
+box_df <- dplyr::bind_rows(
+  tidy_benchmark_info(AML1010_benchmark_info, "AML1010"),
+  tidy_benchmark_info(AML1026_benchmark_info, "AML1026")
+) %>%
+  dplyr::mutate(x_center = as.numeric(protocol)) %>%
+  dplyr::filter(!is.na(x_center)) %>%
+  # deterministic no-overlap x positions
+  dplyr::group_by(protocol) %>%
+  dplyr::arrange(protocol, sample, gene, target_id, .by_group = TRUE) %>%
+  dplyr::mutate(
+    n_in_protocol = dplyr::n(),
+    idx = dplyr::row_number(),
+    offset = dplyr::if_else(
+      n_in_protocol == 1L,
+      0,
+      -DOT_SPREAD + (idx - 1) * (2 * DOT_SPREAD) / (n_in_protocol - 1)
+    ),
+    x = x_center + offset
+  ) %>%
+  dplyr::ungroup()
+
+pub_theme_nogrid <- ggplot2::theme_minimal(base_size = BASE_SIZE) +
+  ggplot2::theme(
+    panel.grid.major = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank(),
+    axis.line.x = ggplot2::element_line(color = "black", linewidth = 0.25),
+    axis.line.y = ggplot2::element_line(color = "black", linewidth = 0.25),
+    axis.ticks = ggplot2::element_line(color = "black", linewidth = 0.25),
+    axis.ticks.length = grid::unit(1, "pt"),
+    axis.text.x = ggplot2::element_blank(),
+    axis.ticks.x = ggplot2::element_blank(),
+    axis.text.y = ggplot2::element_text(size = 5, face = "bold", color = "black"),
+    axis.title = ggplot2::element_text(size = 6, face = "bold", color = "black"),
+    plot.title = ggplot2::element_blank(),
+    plot.margin = grid::unit(c(2, 2, 2, 2), "pt")
+  )
+
+# one boxplot panel; y_col = column to plot
+box_panel <- function(data, y_col, y_name, y_labels = ggplot2::waiver()) {
+  data <- data %>% dplyr::filter(!is.na(.data[[y_col]]))
+  ggplot2::ggplot(data, ggplot2::aes(y = .data[[y_col]])) +
+    ggplot2::geom_boxplot(
+      ggplot2::aes(x = x_center, group = protocol, fill = protocol),
+      outlier.shape = NA, width = 0.55, linewidth = 0.25, color = "black", alpha = 0.85
+    ) +
+    ggplot2::geom_point(
+      ggplot2::aes(x = x, fill = protocol),
+      shape = 21, color = "black", stroke = 0.12, size = 0.8, alpha = 0.95
+    ) +
+    ggplot2::scale_fill_manual(values = PROTOCOL_COLORS, guide = "none") +
+    ggplot2::scale_x_continuous(
+      breaks = seq_along(BOX_PROTOCOL_ORDER),
+      labels = BOX_PROTOCOL_ORDER,
+      expand = ggplot2::expansion(mult = c(0.08, 0.08))
+    ) +
+    ggplot2::scale_y_continuous(
+      name = y_name,
+      labels = y_labels,
+      breaks = scales::pretty_breaks(n = 6),
+      expand = ggplot2::expansion(mult = c(0.02, 0.06))
+    ) +
+    ggplot2::labs(x = NULL) +
+    pub_theme_nogrid
+}
+
+p_cells <- box_panel(box_df, "n_genotyped", "Genotyped cells per target")
+p_eff   <- box_panel(box_df, "genotyping_efficiency", "Genotyping efficiency %",
+                     y_labels = scales::label_percent(accuracy = 1))
+
+p_combined <- p_cells + p_eff + patchwork::plot_layout(ncol = 2)
+print(p_combined)
+
+ggplot2::ggsave(file.path(FIG_DIR, "benchmark_boxplots_cells_and_efficiency.pdf"),
+                plot = p_combined, width = 8, height = 8, units = "cm", useDingbats = FALSE)
+ggplot2::ggsave(file.path(FIG_DIR, "benchmark_boxplots_cells_and_efficiency.png"),
+                plot = p_combined, width = 8, height = 8, units = "cm", dpi = 320)
+```
+
+```{r per-target barplots}
+# ============================================================
+# AML1010.1 + AML1026.1: fraction of cells genotyped per target and protocol
+# Two facet_wrap blocks side-by-side with equal panel size
+# ============================================================
+BAR_PROTOCOL_ORDER <- c("rhPCR", "taqman", "taqman_biotin")
+PROT_X <- c(rhPCR = 1.00, taqman = 1.28, taqman_biotin = 1.56)
+
+BAR_WIDTH <- 0.14
+X_LIM_PAD <- 0.12
+Y_MAX <- 0.60
+
+BASE_FONT <- 9
+LABEL_SIZE <- 2.7
+PANEL_SPACING_LINES <- 0.30
+
+# facet layout (panel size stays constant)
+NCOL_1010 <- 4
+NCOL_1026 <- 3
+
+# fixed facet panel physical size (inches)
+PANEL_W <- 1.25
+PANEL_H <- 1.15
+OUTER_W <- 1.8
+OUTER_H <- 1.6
+
+GENES_1010 <- c("RALY","MCM7","SPNS1","ACIN1","TCF12","TCF12_2","THAP7","C4orf33","CYFIP2","ZNF407","NRAS","RNPEPL1","E2F3")
+GENES_1026 <- c("CSNK1D","MARS1","PNKP","GNB1","LPGAT1","CCDC88B","SRSF2","SF3B1","NRAS")
+
+prot_x <- PROT_X[names(PROT_X) %in% BAR_PROTOCOL_ORDER]
+x_breaks <- unname(prot_x)
+x_min <- min(x_breaks) - X_LIM_PAD
+x_max <- max(x_breaks) + X_LIM_PAD
+prot_cols <- PROTOCOL_COLORS[names(PROTOCOL_COLORS) %in% BAR_PROTOCOL_ORDER]
+
+bar_theme <- function() {
+  ggplot2::theme_classic(base_size = BASE_FONT) +
+    ggplot2::theme(
+      plot.title.position = "plot",
+      plot.title = ggplot2::element_text(face = "bold", size = 11),
+      strip.background = ggplot2::element_blank(),
+      strip.text = ggplot2::element_text(face = "bold", size = 8),
+      axis.text.x = ggplot2::element_blank(),
+      axis.ticks.x = ggplot2::element_blank(),
+      axis.title.x = ggplot2::element_blank(),
+      axis.text.y = ggplot2::element_text(size = 8),
+      axis.title.y = ggplot2::element_text(size = 9),
+      panel.spacing = grid::unit(PANEL_SPACING_LINES, "lines"),
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.box = "horizontal",
+      legend.title = ggplot2::element_blank(),
+      legend.text = ggplot2::element_text(size = 8),
+      legend.key.height = grid::unit(0.35, "cm"),
+      legend.key.width  = grid::unit(0.7, "cm")
+    )
+}
+
+# per-sample table: fraction of benchmark cells genotyped per (gene, protocol)
+build_sample_df <- function(bench_sample, obj, benchmark_list, gene_order) {
+
+  all_cells <- colnames(obj)
+  bench_cells <- all_cells[startsWith(all_cells, paste0(bench_sample, "_"))]
+  if (length(bench_cells) == 0) stop("No benchmark cells for ", bench_sample)
+  n_bench_cells <- length(bench_cells)
+
+  targeted_genes <- sort(unique(names(benchmark_list)))
+  genes_use <- gene_order[gene_order %in% targeted_genes]
+  if (length(genes_use) == 0) stop("No requested targets found for ", bench_sample)
+
+  geno_obs <- purrr::imap_dfr(benchmark_list, ~ dplyr::mutate(.x, gene = .y)) %>%
+    dplyr::transmute(
+      bc = as.character(bc),
+      protocol = as.character(protocol),
+      gene = as.character(gene),
+      coverage = as.integer(alt) + as.integer(ref),
+      sample_name = as.character(sample_name)
+    ) %>%
+    dplyr::filter(sample_name == bench_sample) %>%
+    dplyr::group_by(gene, protocol, bc) %>%
+    dplyr::summarise(coverage = max(coverage, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::mutate(genotyped = coverage >= COVERAGE_MIN) %>%
+    dplyr::filter(bc %in% bench_cells, gene %in% genes_use, protocol %in% BAR_PROTOCOL_ORDER)
+
+  if (nrow(geno_obs) == 0) stop("geno_obs empty for ", bench_sample)
+
+  tidyr::expand_grid(bc = bench_cells, gene = genes_use, protocol = BAR_PROTOCOL_ORDER) %>%
+    dplyr::left_join(dplyr::select(geno_obs, bc, gene, protocol, genotyped),
+                     by = c("bc", "gene", "protocol")) %>%
+    dplyr::mutate(genotyped = tidyr::replace_na(genotyped, FALSE)) %>%
+    dplyr::group_by(gene, protocol) %>%
+    dplyr::summarise(
+      n_total = dplyr::n(),
+      n_genotyped = sum(genotyped),
+      frac_genotyped = n_genotyped / n_total,
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      sample = bench_sample,
+      n_bench_cells = n_bench_cells,
+      gene = factor(gene, levels = genes_use),
+      protocol = factor(protocol, levels = BAR_PROTOCOL_ORDER),
+      x = unname(prot_x[as.character(protocol)]),
+      label = ifelse(n_genotyped == 0, "", as.character(n_genotyped))
+    )
+}
+
+bar_1010 <- build_sample_df("AML1010.1", obj_1010, AML1010_benchmark, GENES_1010)
+bar_1026 <- build_sample_df("AML1026.1", obj_1026, AML1026_benchmark, GENES_1026)
+
+# pad the smaller block (AML1026) with empty facets so both blocks have the same number of rows
+nrow_1010 <- ceiling(length(levels(bar_1010$gene)) / NCOL_1010)
+nrow_1026 <- ceiling(length(levels(bar_1026$gene)) / NCOL_1026)
+target_rows <- max(nrow_1010, nrow_1026)
+need_dummy <- target_rows * NCOL_1026 - length(levels(bar_1026$gene))
+
+if (need_dummy > 0) {
+  dummy_genes <- paste0("ZZ_dummy_", seq_len(need_dummy))
+  dummy_df <- tidyr::expand_grid(gene = dummy_genes, protocol = BAR_PROTOCOL_ORDER) %>%
+    dplyr::mutate(
+      n_total = NA_integer_,
+      n_genotyped = 0L,
+      frac_genotyped = 0,
+      sample = "AML1026.1",
+      n_bench_cells = unique(bar_1026$n_bench_cells),
+      protocol = factor(protocol, levels = BAR_PROTOCOL_ORDER),
+      x = unname(prot_x[as.character(protocol)]),
+      label = ""
+    )
+  bar_1026 <- dplyr::bind_rows(bar_1026, dummy_df) %>%
+    dplyr::mutate(gene = factor(as.character(gene), levels = c(levels(bar_1026$gene), dummy_genes)))
+}
+
+# one facetted bar block per sample
+bar_block <- function(data, ncol, title, y_lab, labeller = "label_value") {
+  ggplot2::ggplot(data, ggplot2::aes(x = x, y = frac_genotyped, fill = protocol)) +
+    ggplot2::geom_col(width = BAR_WIDTH, color = "black", linewidth = 0.2) +
+    ggplot2::geom_text(ggplot2::aes(label = label), vjust = -0.35, size = LABEL_SIZE) +
+    ggh4x::facet_wrap2(~ gene, ncol = ncol, scales = "fixed", axes = "all", labeller = labeller) +
+    ggplot2::scale_x_continuous(breaks = x_breaks, limits = c(x_min, x_max)) +
+    ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                                expand = ggplot2::expansion(mult = c(0, 0.08))) +
+    ggplot2::coord_cartesian(ylim = c(0, Y_MAX)) +
+    ggplot2::scale_fill_manual(values = prot_cols, breaks = BAR_PROTOCOL_ORDER) +
+    ggplot2::labs(title = title, y = y_lab) +
+    bar_theme() +
+    ggplot2::theme(legend.position = "none")
+}
+
+p1010 <- bar_block(bar_1010, NCOL_1010,
+                   paste0("AML1010.1 (n=", unique(bar_1010$n_bench_cells), ")"),
+                   "Fraction of cells genotyped")
+p1026 <- bar_block(bar_1026, NCOL_1026,
+                   paste0("AML1026.1 (n=", unique(bar_1026$n_bench_cells), ")"),
+                   NULL,
+                   labeller = ggplot2::as_labeller(function(g) ifelse(grepl("^ZZ_dummy_", g), "", g))) +
+  ggplot2::theme(axis.title.y = ggplot2::element_blank())
+
+legend <- cowplot::get_legend(
+  ggplot2::ggplot(bar_1010, ggplot2::aes(x = x, y = frac_genotyped, fill = protocol)) +
+    ggplot2::geom_col() +
+    ggplot2::scale_fill_manual(values = prot_cols, breaks = BAR_PROTOCOL_ORDER) +
+    ggplot2::theme_void(base_size = BASE_FONT) +
+    ggplot2::theme(legend.position = "bottom", legend.title = ggplot2::element_blank())
+)
+
+combined <- (p1010 | p1026) +
+  patchwork::plot_layout(widths = c(NCOL_1010, NCOL_1026)) +
+  patchwork::plot_annotation(title = "Genotyping yield per target (background = all cells)")
+
+final_plot <- combined / patchwork::wrap_elements(legend)
+
+W <- OUTER_W + PANEL_W * (NCOL_1010 + NCOL_1026)
+H <- OUTER_H + PANEL_H * target_rows + 0.9
+
+ggplot2::ggsave(file.path(FIG_DIR, "benchmark_barplots_per_target.pdf"), final_plot, width = W, height = H, useDingbats = FALSE)
+ggplot2::ggsave(file.path(FIG_DIR, "benchmark_barplots_per_target.png"), final_plot, width = W, height = H, dpi = 300)
+```
+
+```{r efficiency vs target features}
+# ============================================================
+# Genotyping efficiency vs target features (AML1010 + AML1026 pooled)
+#   - one point per (mutation, protocol); top 3 per protocol labelled
+#   - linear fit per protocol with R^2 and slope p-value per facet
+# ============================================================
+FEAT_PROTOCOL_ORDER <- c("rhPCR", "taqman", "taqman_biotin")
+
+feat_df <- dplyr::bind_rows(
+  AML1010_benchmark_info %>% dplyr::mutate(sample = "AML1010"),
+  AML1026_benchmark_info %>% dplyr::mutate(sample = "AML1026")
+) %>%
+  dplyr::mutate(mutation_id = paste0(sample, ":", `#Uploaded_variation`)) %>%
+  dplyr::select(
+    mutation_id, SYMBOL,
+    transcript_length, distance_to_5p, expr_mean_counts, expr_frac_expressing,
+    dplyr::starts_with("genotyping_efficiency_"),
+    dplyr::starts_with("n_genotyped_cells_"),
+    n_total_cells
+  ) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::matches("^(genotyping_efficiency|n_genotyped_cells)_(.+)$"),
+    names_to = c(".value", "protocol"),
+    names_pattern = "^(genotyping_efficiency|n_genotyped_cells)_(.+)$"
+  ) %>%
+  dplyr::mutate(
+    protocol = stringr::str_replace_all(protocol, "\\.", "_"),
+    protocol = factor(protocol, levels = FEAT_PROTOCOL_ORDER),
+    genotyping_efficiency = dplyr::coalesce(genotyping_efficiency, 0),
+    n_genotyped_cells = dplyr::coalesce(n_genotyped_cells, 0L),
+    eff_pct = 100 * genotyping_efficiency
+  ) %>%
+  dplyr::group_by(protocol) %>%
+  dplyr::mutate(
+    rank_eff = dplyr::min_rank(dplyr::desc(eff_pct)),
+    label_me = rank_eff <= 3
+  ) %>%
+  dplyr::ungroup()
+
+# per-protocol linear model stats: R^2 + p-value of the slope
+lm_stats_by_protocol <- function(data, x_col) {
+  data %>%
+    dplyr::group_by(protocol) %>%
+    dplyr::summarise(
+      n = sum(!is.na(.data[[x_col]]) & !is.na(eff_pct)),
+      fit = list(stats::lm(eff_pct ~ .data[[x_col]], data = dplyr::pick(dplyr::everything()))),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      r_squared = purrr::map_dbl(fit, ~ summary(.x)$r.squared),
+      p_value   = purrr::map_dbl(fit, ~ {
+        co <- summary(.x)$coefficients
+        if (nrow(co) >= 2) co[2, "Pr(>|t|)"] else NA_real_
+      }),
+      label = dplyr::if_else(
+        is.na(p_value),
+        sprintf("R² = %.2f\np = NA", r_squared),
+        sprintf("R² = %.2f\np = %s", r_squared, scales::pvalue(p_value, accuracy = 0.001))
+      )
+    ) %>%
+    dplyr::select(protocol, n, r_squared, p_value, label)
+}
+
+feat_theme <- function() {
+  ggplot2::theme_classic(base_size = 10) +
+    ggplot2::theme(
+      legend.position = "bottom",
+      strip.background = ggplot2::element_blank(),
+      strip.text = ggplot2::element_text(face = "bold"),
+      axis.title = ggplot2::element_text(face = "bold"),
+      plot.title = ggplot2::element_blank(),
+      panel.grid.major = ggplot2::element_blank(),
+      panel.grid.minor = ggplot2::element_blank()
+    )
+}
+
+scatter_eff <- function(data, x, xlab, xscale = c("identity", "log10")) {
+  xscale <- match.arg(xscale)
+  stats_df <- lm_stats_by_protocol(data, x)
+
+  p <- ggplot2::ggplot(data, ggplot2::aes(x = .data[[x]], y = eff_pct)) +
+    # regression line with confidence band, black outline, colored line on top
+    ggplot2::geom_smooth(ggplot2::aes(color = protocol), method = "lm", se = TRUE, linewidth = 0.9, alpha = 0.15) +
+    ggplot2::geom_smooth(ggplot2::aes(group = protocol), method = "lm", se = FALSE, linewidth = 1.2, color = "black") +
+    ggplot2::geom_smooth(ggplot2::aes(color = protocol), method = "lm", se = FALSE, linewidth = 0.7) +
+    # points: black outline + protocol-colored fill
+    ggplot2::geom_point(ggplot2::aes(fill = protocol), shape = 21, color = "black", stroke = 0.5, size = 2.8, alpha = 0.95) +
+    # labels (top 3 per protocol)
+    ggrepel::geom_text_repel(
+      data = data %>% dplyr::filter(label_me),
+      ggplot2::aes(label = SYMBOL, color = protocol),
+      size = 2.6, max.overlaps = Inf, box.padding = 0.25, min.segment.length = 0, show.legend = FALSE
+    ) +
+    # R^2 + p-value per facet
+    ggplot2::geom_text(
+      data = stats_df, ggplot2::aes(label = label),
+      x = -Inf, y = Inf, hjust = -0.05, vjust = 1.05,
+      inherit.aes = FALSE, size = 3.0, color = "black"
+    ) +
+    ggplot2::facet_wrap(~ protocol, nrow = 1) +
+    ggplot2::scale_color_manual(values = PROTOCOL_COLORS, drop = FALSE) +
+    ggplot2::scale_fill_manual(values = PROTOCOL_COLORS, drop = FALSE, guide = "none") +
+    ggplot2::scale_y_continuous(breaks = seq(0, 50, 10), expand = ggplot2::expansion(mult = c(0.02, 0.05))) +
+    ggplot2::coord_cartesian(ylim = c(0, 51), clip = "off") +
+    ggplot2::labs(x = xlab, y = "Genotyping efficiency (%)", color = NULL) +
+    feat_theme() +
+    ggplot2::theme(plot.margin = ggplot2::margin(5.5, 12, 5.5, 5.5))
+
+  if (xscale == "log10") {
+    p <- p + ggplot2::scale_x_log10(labels = scales::label_number())
+  }
+  p
+}
+
+p_len       <- scatter_eff(feat_df, "transcript_length",    "Transcript length (nt)",                  "log10")
+p_5p        <- scatter_eff(feat_df, "distance_to_5p",       "Distance from 5′ end (nt)",               "log10")
+p_expr_mean <- scatter_eff(feat_df, "expr_mean_counts",     "Mean expression (counts per cell)",       "log10")
+p_expr_frac <- scatter_eff(feat_df, "expr_frac_expressing", "Fraction of cells expressing (counts ≥ 1)", "identity") +
+  ggplot2::scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25))
+
+fig <- (p_len | p_5p) / (p_expr_mean | p_expr_frac) +
+  patchwork::plot_layout(guides = "collect") &
+  ggplot2::theme(legend.position = "bottom")
+fig
+
+ggplot2::ggsave(file.path(FIG_DIR, "efficiency_vs_features.pdf"), fig, width = 14, height = 10, units = "in", useDingbats = FALSE)
+ggplot2::ggsave(file.path(FIG_DIR, "efficiency_vs_features.png"), fig, width = 14, height = 10, units = "in", dpi = 350)
+
+# stats table for all feature x protocol combinations
+FEATURES <- c(
+  transcript_length    = "Transcript length (nt)",
+  distance_to_5p       = "Distance from 5′ end (nt)",
+  expr_mean_counts     = "Mean expression (counts per cell)",
+  expr_frac_expressing = "Fraction of cells expressing"
+)
+feature_stats <- purrr::imap_dfr(FEATURES, function(feature_label, feature_col) {
+  lm_stats_by_protocol(feat_df, feature_col) %>%
+    dplyr::mutate(feature = feature_col, feature_label = feature_label, .before = 1) %>%
+    dplyr::select(-label)
+})
+feature_stats
+readr::write_tsv(feature_stats, file.path(FIG_DIR, "efficiency_vs_features_stats.tsv"))
+```
+
+```{r benchmark metrics}
+# ============================================================
+# Numbers reported in the text
+# ============================================================
+
+# ---- 1) rhPCR vs taqman: per-variant concordance + pooled efficiency ----
+all_info <- dplyr::bind_rows(
+  AML1010_benchmark_info %>% dplyr::mutate(sample = "AML1010"),
+  AML1026_benchmark_info %>% dplyr::mutate(sample = "AML1026")
+) %>%
+  dplyr::transmute(
+    sample, SYMBOL, n_total_cells,
+    n_rhPCR    = n_genotyped_cells_rhPCR,
+    n_taqman   = n_genotyped_cells_taqman,
+    eff_rhPCR  = genotyping_efficiency_rhPCR,
+    eff_taqman = genotyping_efficiency_taqman
+  )
+
+# global weighted efficiency (pooled across both samples/variants)
+global_eff <- all_info %>%
+  dplyr::summarise(
+    rhPCR  = sum(n_rhPCR,  na.rm = TRUE) / sum(n_total_cells, na.rm = TRUE),
+    taqman = sum(n_taqman, na.rm = TRUE) / sum(n_total_cells, na.rm = TRUE)
+  )
+
+# variant-level concordance + median per-variant difference
+pairwise_rt <- all_info %>%
+  dplyr::filter(!is.na(eff_rhPCR), !is.na(eff_taqman)) %>%
+  dplyr::mutate(delta = eff_rhPCR - eff_taqman)
+
+cor_test <- stats::cor.test(pairwise_rt$eff_rhPCR, pairwise_rt$eff_taqman, method = "spearman")
+median_delta <- stats::median(pairwise_rt$delta, na.rm = TRUE)
+
+cat(sprintf(
+  "Spearman r = %.2f, p = %.3g\nMedian per-variant Δ (rhPCR - direct) = %.4f (%.2f%% points)\nGlobal efficiency: rhPCR = %.1f%%, direct = %.1f%%\n",
+  unname(cor_test$estimate), cor_test$p.value,
+  median_delta, 100 * median_delta,
+  100 * global_eff$rhPCR, 100 * global_eff$taqman
+))
+
+# ---- 2) cell-level efficiency: cells with >= 1 genotyped target / all cells of the sample ----
+# mode = "present": a cell counts if it appears at least once for that protocol
+# mode = "covered": a cell counts only if alt + ref > 0 at least once for that protocol
+cell_level_efficiency <- function(benchmark_list, total_cells, mode = c("present", "covered")) {
+  mode <- match.arg(mode)
+  df <- dplyr::bind_rows(benchmark_list, .id = "target_id") %>%
+    dplyr::select(bc, protocol, alt, ref)
+  if (mode == "covered") {
+    df <- df %>% dplyr::filter(!is.na(alt), !is.na(ref), (alt + ref) > 0)
+  }
+  df %>%
+    dplyr::group_by(protocol) %>%
+    dplyr::summarise(n_cells_with_ge1_target = dplyr::n_distinct(bc), .groups = "drop") %>%
+    dplyr::mutate(total_cells = total_cells,
+                  cell_level_eff = n_cells_with_ge1_target / total_cells)
+}
+
+total_1010 <- max(AML1010_benchmark_info$n_total_cells, na.rm = TRUE)
+total_1026 <- max(AML1026_benchmark_info$n_total_cells, na.rm = TRUE)
+
+cell_efficiency <- dplyr::bind_rows(
+  cell_level_efficiency(AML1010_benchmark, total_1010, mode = "present") %>% dplyr::mutate(sample = "AML1010"),
+  cell_level_efficiency(AML1026_benchmark, total_1026, mode = "present") %>% dplyr::mutate(sample = "AML1026")
+) %>%
+  dplyr::arrange(sample, protocol)
+print(cell_efficiency)
+
+# pooled across both samples (weighted by total cells)
+pooled_present <- cell_efficiency %>%
+  dplyr::group_by(protocol) %>%
+  dplyr::summarise(
+    n_cells_with_ge1_target = sum(n_cells_with_ge1_target),
+    total_cells = sum(total_cells),
+    pooled_cell_level_eff = n_cells_with_ge1_target / total_cells,
+    .groups = "drop"
+  )
+print(pooled_present)
+```
