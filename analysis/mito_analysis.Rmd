@@ -1,0 +1,418 @@
+---
+title: "AML1010 mitochondrial variants in TCF12 vs TCF12_2 subclones"
+output: html_document
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(SummarizedExperiment)
+  library(GenomicRanges)
+  library(ggplot2)
+  library(ggrepel)
+  library(scales)
+  library(qs2)
+})
+
+## =========================================================
+## Paths
+## =========================================================
+PROJECT_DIR <- "/path/to/project"
+AML1010_DIR <- file.path(PROJECT_DIR, "AML1010")
+out_dir     <- file.path(PROJECT_DIR, "AML1010_1026/plots")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# helper functions (computeAFMutMatrix) from the MAESTER analysis code
+source(file.path(AML1010_DIR, "scripts/210215_FunctionsGeneral.R"))
+
+## =========================================================
+## Inputs
+##   - Seurat object: AML1010_scrna_preprocessing.R
+##   - rhPCR mutation list: extract_mutations_AML1010.R
+##   - maegatk output: preprocessing/aml1010_mito/02_maegatk.sh
+## =========================================================
+obj_1010      <- qs2::qs_read(file.path(AML1010_DIR, "objects/obj_1010_with_BoneMarrowMap_Broad_final.qs2"))
+AML1010_rhPCR <- readRDS(file.path(AML1010_DIR, "objects/AML1010_rhPCRonly_mutation_data_list_inSeurat.rds"))
+AML1010.1.mito <- readRDS(file.path(AML1010_DIR, "data/mito/maegatk/AML1010.1_mito/final/maegatk.rds"))
+AML1010.3.mito <- readRDS(file.path(AML1010_DIR, "data/mito/maegatk/AML1010.3_mito/final/maegatk.rds"))
+AML1010.5.mito <- readRDS(file.path(AML1010_DIR, "data/mito/maegatk/AML1010.5_mito/final/maegatk.rds"))
+```
+
+```{r mito variant association}
+## =========================================================
+## SETTINGS
+## =========================================================
+min_depth             <- 5     # whole-cell average depth floor (initial cell inclusion)
+min_pos_depth         <- 5     # PER-POSITION depth required to trust a presence/absence call
+present_cutoff         <- 5    # AF% cutoff for "present"
+min_cells_with_variant <- 50   # overall prevalence floor (on well-covered cells only)
+min_frac_genotyped     <- 0.6  # require >=60% of EACH group to be well-covered at that position
+min_abs_delta           <- 0.10 # minimum prevalence difference to report as a candidate
+
+## =========================================================
+## 1) Build AF matrix + matching PER-POSITION coverage matrix, per timepoint
+## =========================================================
+build_af_and_coverage <- function(mito_rse, sample_prefix, min_depth = 5, scale_to_percent = TRUE) {
+  af <- data.matrix(computeAFMutMatrix(mito_rse))
+  if (scale_to_percent) af <- af * 100
+  rownames(af) <- gsub("_", "", rownames(af))
+
+  # whole-cell depth (initial cell filter, same as before)
+  depths <- SummarizedExperiment::colData(mito_rse)$depth
+  names(depths) <- colnames(mito_rse)
+  keep_cells <- intersect(names(depths)[depths >= min_depth], colnames(af))
+  af <- af[, keep_cells, drop = FALSE]
+
+  # per-position coverage assay: positions x cells (all 16569 positions)
+  cov_assay <- SummarizedExperiment::assay(mito_rse, "coverage")
+  gr <- SummarizedExperiment::rowRanges(mito_rse)
+  positions_all <- GenomicRanges::start(gr)
+
+  # extract genomic position from each variant name, e.g. "676G>A" -> 676
+  variant_positions <- as.numeric(gsub("[^0-9].*$", "", rownames(af)))
+
+  # match each variant's row to its position's coverage row
+  pos_row_idx <- match(variant_positions, positions_all)
+  stopifnot(all(!is.na(pos_row_idx)))  # sanity check: every variant position found
+
+  cov_mat <- cov_assay[pos_row_idx, keep_cells, drop = FALSE]
+  rownames(cov_mat) <- rownames(af)
+
+  colnames(af)      <- paste0(sample_prefix, "_", colnames(af), "-1")
+  colnames(cov_mat)  <- paste0(sample_prefix, "_", colnames(cov_mat), "-1")
+
+  list(af = af, cov = cov_mat)
+}
+
+res1 <- build_af_and_coverage(AML1010.1.mito, "AML1010.1", min_depth = min_depth)
+res3 <- build_af_and_coverage(AML1010.3.mito, "AML1010.3", min_depth = min_depth)
+res5 <- build_af_and_coverage(AML1010.5.mito, "AML1010.5", min_depth = min_depth)
+
+## =========================================================
+## 2) Merge across timepoints (AF and coverage together, same variants/cells)
+## =========================================================
+common_vars <- Reduce(intersect, list(rownames(res1$af), rownames(res3$af), rownames(res5$af)))
+
+af_merged  <- cbind(res1$af[common_vars, ,  drop = FALSE],
+                     res3$af[common_vars, ,  drop = FALSE],
+                     res5$af[common_vars, ,  drop = FALSE])
+cov_merged <- cbind(res1$cov[common_vars, , drop = FALSE],
+                     res3$cov[common_vars, , drop = FALSE],
+                     res5$cov[common_vars, , drop = FALSE])
+
+# restrict to Seurat cells
+keep_cols <- colnames(af_merged) %in% colnames(obj_1010)
+af_merged  <- af_merged[, keep_cols, drop = FALSE]
+cov_merged <- cov_merged[, keep_cols, drop = FALSE]
+
+stopifnot(identical(dim(af_merged), dim(cov_merged)))
+rm(res1, res3, res5)
+
+cat("Merged matrices:", nrow(af_merged), "variants x", ncol(af_merged), "cells\n")
+
+## =========================================================
+## 3) Build mutually-exclusive TCF12 / TCF12_2 groups (unchanged logic)
+## =========================================================
+t1 <- AML1010_rhPCR$TCF12
+t2 <- AML1010_rhPCR$TCF12_2
+cells_in_seurat <- colnames(obj_1010)
+
+collapse_status <- function(df, cells_keep) {
+  df %>%
+    dplyr::mutate(bc = as.character(bc), mutated = as.character(mutated)) %>%
+    dplyr::filter(bc %in% cells_keep) %>%
+    dplyr::group_by(bc) %>%
+    dplyr::summarise(
+      status = dplyr::case_when(
+        any(mutated == "mutated")  ~ "mutated",
+        any(mutated == "wildtype") ~ "wildtype",
+        TRUE ~ "unknown"
+      ), .groups = "drop")
+}
+
+t1_map <- collapse_status(t1, cells_in_seurat)
+t2_map <- collapse_status(t2, cells_in_seurat)
+
+obj_1010@meta.data$TCF12_1_status <- "unknown"
+obj_1010@meta.data$TCF12_2_status <- "unknown"
+obj_1010@meta.data[t1_map$bc, "TCF12_1_status"] <- t1_map$status
+obj_1010@meta.data[t2_map$bc, "TCF12_2_status"] <- t2_map$status
+
+cells_mut_t1 <- rownames(obj_1010@meta.data)[obj_1010@meta.data$TCF12_1_status == "mutated"]
+cells_mut_t2 <- rownames(obj_1010@meta.data)[obj_1010@meta.data$TCF12_2_status == "mutated"]
+cells_mut_both <- intersect(cells_mut_t1, cells_mut_t2)
+
+cells_tcf12_only   <- setdiff(cells_mut_t1, cells_mut_both)
+cells_tcf12_2_only <- setdiff(cells_mut_t2, cells_mut_both)
+
+mito_cells <- colnames(af_merged)
+cells_g1 <- intersect(cells_tcf12_only,   mito_cells)   # TCF12-only
+cells_g2 <- intersect(cells_tcf12_2_only, mito_cells)   # TCF12_2-only
+
+cat("TCF12-only (any mito coverage):", length(cells_g1), "\n")
+cat("TCF12_2-only (any mito coverage):", length(cells_g2), "\n")
+
+## =========================================================
+## 4) Per-variant: use ONLY cells genotyped (coverage >= min_pos_depth) at that position
+##    Require both groups to be >= min_frac_genotyped covered, else drop the variant
+## =========================================================
+af_g1  <- af_merged[,  cells_g1, drop = FALSE]
+cov_g1 <- cov_merged[, cells_g1, drop = FALSE]
+af_g2  <- af_merged[,  cells_g2, drop = FALSE]
+cov_g2 <- cov_merged[, cells_g2, drop = FALSE]
+
+n1_total <- length(cells_g1); n2_total <- length(cells_g2)
+
+genotyped_g1 <- cov_g1 >= min_pos_depth   # variants x cells, logical
+genotyped_g2 <- cov_g2 >= min_pos_depth
+
+frac_genotyped_g1 <- rowSums(genotyped_g1) / n1_total
+frac_genotyped_g2 <- rowSums(genotyped_g2) / n2_total
+
+well_genotyped <- frac_genotyped_g1 >= min_frac_genotyped &
+                  frac_genotyped_g2 >= min_frac_genotyped
+
+cat("\nVariants passing genotyping-completeness filter (>=", min_frac_genotyped*100,
+    "% covered in BOTH groups):", sum(well_genotyped), "of", nrow(af_merged), "\n")
+
+af_g1_wg  <- af_g1[well_genotyped, , drop = FALSE]
+cov_g1_wg <- cov_g1[well_genotyped, , drop = FALSE]
+af_g2_wg  <- af_g2[well_genotyped, , drop = FALSE]
+cov_g2_wg <- cov_g2[well_genotyped, , drop = FALSE]
+
+## =========================================================
+## 5) Compute presence ONLY among genotyped cells; Fisher's test with per-variant n1/n2
+## =========================================================
+present_fun <- function(af, cov) (af > present_cutoff) & (cov >= min_pos_depth)
+genotyped_fun <- function(cov) cov >= min_pos_depth
+
+a <- rowSums(present_fun(af_g1_wg, cov_g1_wg))         # present, TCF12-only
+n1_v <- rowSums(genotyped_fun(cov_g1_wg))               # genotyped, TCF12-only (per-variant n)
+b <- n1_v - a
+
+c <- rowSums(present_fun(af_g2_wg, cov_g2_wg))          # present, TCF12_2-only
+n2_v <- rowSums(genotyped_fun(cov_g2_wg))                # genotyped, TCF12_2-only (per-variant n)
+d <- n2_v - c
+
+frac1 <- a / n1_v
+frac2 <- c / n2_v
+delta <- frac1 - frac2
+eps <- 1e-6
+rr_1_over_2 <- (frac1 + eps) / (frac2 + eps)
+rr_2_over_1 <- (frac2 + eps) / (frac1 + eps)
+
+pval <- vapply(seq_along(a), function(i) {
+  suppressWarnings(fisher.test(matrix(c(a[i], b[i], c[i], d[i]), nrow = 2))$p.value)
+}, numeric(1))
+padj <- p.adjust(pval, method = "BH")
+
+mito_clone_assoc_robust <- data.frame(
+  variant        = rownames(af_g1_wg),
+  n1_genotyped   = n1_v,
+  n2_genotyped   = n2_v,
+  present_TCF12   = a,
+  present_TCF12_2 = c,
+  frac_TCF12      = frac1,
+  frac_TCF12_2    = frac2,
+  delta_frac      = delta,
+  rr_1_over_2     = rr_1_over_2,
+  rr_2_over_1     = rr_2_over_1,
+  p_value         = pval,
+  p_adj           = padj,
+  stringsAsFactors = FALSE
+)
+
+## =========================================================
+## 6) NO threshold-based inclusion filter — just rank by significance
+##    (only genotyping-completeness from step 4 is applied upstream)
+## =========================================================
+ranked_TCF12 <- mito_clone_assoc_robust %>%
+  dplyr::filter(delta_frac >= min_abs_delta) %>%   # keep only effect-size direction/magnitude, no presence/leakage caps
+  dplyr::arrange(p_adj, p_value)
+
+ranked_TCF12_2 <- mito_clone_assoc_robust %>%
+  dplyr::filter(delta_frac <= -min_abs_delta) %>%
+  dplyr::arrange(p_adj, p_value)
+
+cat("\n=== Ranked candidates (genotyping-complete, delta >= 0.10, no presence/leakage caps) ===\n")
+cat("TCF12-only:", nrow(ranked_TCF12), "\n")
+print(head(ranked_TCF12, 20))
+
+cat("\nTCF12_2-only:", nrow(ranked_TCF12_2), "\n")
+print(head(ranked_TCF12_2, 20))
+
+## Explicitly flag which ones are BH-significant
+cat("\n=== BH-significant (p_adj < 0.05) ===\n")
+print(mito_clone_assoc_robust %>% dplyr::filter(p_adj < 0.05) %>% dplyr::arrange(p_adj))
+```
+
+```{r volcano adjusted p}
+plot_mito_volcano <- function(assoc_df,
+                               delta_cutoff = 0.10,
+                               padj_cutoff  = 0.05) {
+
+  df <- assoc_df %>%
+    dplyr::mutate(
+      neg_log10_padj = -log10(pmax(p_adj, 1e-300)),
+      category = dplyr::case_when(
+        p_adj < padj_cutoff & delta_frac >=  delta_cutoff ~ "Significant: TCF12-only",
+        p_adj < padj_cutoff & delta_frac <= -delta_cutoff ~ "Significant: TCF12_2-only",
+        abs(delta_frac) >= delta_cutoff                    ~ "Candidate (not p_adj-significant)",
+        TRUE ~ "NS"
+      ),
+      category = factor(category, levels = c("Significant: TCF12-only",
+                                               "Significant: TCF12_2-only",
+                                               "Candidate (not p_adj-significant)",
+                                               "NS"))
+    )
+
+  # label every candidate/significant variant (|delta| >= cutoff)
+  all_labels <- df %>%
+    dplyr::filter(category != "NS")
+
+  cat("Labeling", nrow(all_labels), "variants with |delta_frac| >=", delta_cutoff, "\n")
+
+  p <- ggplot(df, aes(x = delta_frac, y = neg_log10_padj, color = category)) +
+    geom_point(alpha = 0.7, size = 2) +
+    geom_vline(xintercept = c(-delta_cutoff, delta_cutoff), linetype = "dashed", color = "grey40") +
+    geom_hline(yintercept = -log10(padj_cutoff), linetype = "dashed", color = "grey40") +
+    ggrepel::geom_text_repel(
+      data = all_labels,
+      aes(label = variant),
+      size = 3, max.overlaps = Inf, show.legend = FALSE
+    ) +
+    scale_color_manual(values = c(
+      "Significant: TCF12-only"           = "#D55E00",
+      "Significant: TCF12_2-only"         = "#0072B2",
+      "Candidate (not p_adj-significant)" = "grey45",
+      "NS"                                 = "grey85"
+    )) +
+    labs(
+      x = "Prevalence difference (\u0394frac)",
+      y = expression(-log[10](adj.~italic(p)~value))
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "none"
+    )
+
+  return(p)
+}
+
+# -----------------------------
+# Generate + save
+# -----------------------------
+p_volcano_robust <- plot_mito_volcano(mito_clone_assoc_robust)
+p_volcano_robust
+
+
+ggsave(
+  filename = file.path(out_dir, "mito_volcano_TCF12_vs_TCF12_2_final.pdf"),
+  plot     = p_volcano_robust,
+  width    = 9,
+  height   = 10,
+  units    = "cm"
+)
+```
+
+```{r volcano raw p}
+save_png_pdf <- function(prefix, plot, width = 5, height = 6, units = "cm", dpi = 600) {
+  ggplot2::ggsave(paste0(prefix, ".png"), plot = plot, width = width, height = height, units = units, dpi = dpi)
+  ggplot2::ggsave(paste0(prefix, ".pdf"), plot = plot, width = width, height = height, units = units, device = cairo_pdf)
+}
+
+plot_mito_volcano_raw <- function(assoc_df,
+                                   delta_cutoff = 0.10,
+                                   p_cutoff     = 0.05) {
+
+  df <- assoc_df %>%
+    dplyr::mutate(
+      neg_log10_p = -log10(pmax(p_value, 1e-300)),
+      category = dplyr::case_when(
+        p_value < p_cutoff & delta_frac >=  delta_cutoff ~ "Raw-p significant: TCF12-only",
+        p_value < p_cutoff & delta_frac <= -delta_cutoff ~ "Raw-p significant: TCF12_2-only",
+        abs(delta_frac) >= delta_cutoff                   ~ "Candidate (delta only)",
+        TRUE ~ "NS"
+      ),
+      category = factor(category, levels = c("Raw-p significant: TCF12-only",
+                                               "Raw-p significant: TCF12_2-only",
+                                               "Candidate (delta only)",
+                                               "NS"))
+    )
+
+  all_labels <- df %>%
+    dplyr::filter(category != "NS")
+
+  cat("Labeling", nrow(all_labels), "variants with |delta_frac| >=", delta_cutoff, "\n")
+
+  ymax <- max(df$neg_log10_p, na.rm = TRUE) * 1.1
+  y_breaks <- unique(c(0, -log10(p_cutoff), pretty(c(0, ymax))))
+  y_breaks <- y_breaks[y_breaks >= 0 & y_breaks <= ymax]
+
+  colors <- c(
+    "Raw-p significant: TCF12-only"   = "firebrick",
+    "Raw-p significant: TCF12_2-only" = "#0072B2",
+    "Candidate (delta only)"           = "grey45",
+    "NS"                                = "lightgrey"
+  )
+
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = delta_frac, y = neg_log10_p, color = category)) +
+    ggplot2::geom_point(size = 0.25, alpha = 0.8, stroke = 0) +
+    ggplot2::scale_color_manual(values = colors) +
+    ggplot2::geom_hline(yintercept = -log10(p_cutoff), linetype = "dashed", color = "black", linewidth = 0.2, alpha = 0.3) +
+    ggplot2::geom_vline(xintercept = c(-delta_cutoff, delta_cutoff), linetype = "dashed", color = "black", linewidth = 0.2, alpha = 0.3) +
+    ggplot2::scale_x_continuous(
+      breaks = c(-0.3, -0.15, 0, 0.15, 0.3),
+      labels = c("-0.3", "-0.15", "0", "0.15", "0.3")
+    ) +
+    ggplot2::scale_y_continuous(
+      limits = c(0, ymax),
+      breaks = y_breaks,
+      labels = scales::label_number(accuracy = 1),
+      expand = c(0, 0)
+    ) +
+    ggrepel::geom_text_repel(
+      data = all_labels,
+      ggplot2::aes(label = variant),
+      size = 1.4,
+      color = "black",
+      segment.size = 0.1,
+      segment.alpha = 0.5,
+      box.padding = 0.05,
+      point.padding = 0.05,
+      min.segment.length = 0,
+      max.overlaps = 40,
+      force = 2
+    ) +
+    ggplot2::labs(
+      x = "Prevalence difference (\u0394frac)",
+      y = expression(-log[10](italic(p)~value~"(raw)"))
+    ) +
+    ggplot2::theme_minimal(base_size = 5) +
+    ggplot2::theme(
+      legend.position = "none",
+      axis.title  = ggplot2::element_text(size = 5),
+      axis.text   = ggplot2::element_text(size = 4),
+      panel.grid  = ggplot2::element_blank(),
+      panel.border = ggplot2::element_blank(),
+      axis.line   = ggplot2::element_line(color = "black", linewidth = 0.2),
+      axis.ticks  = ggplot2::element_line(color = "black", linewidth = 0.2),
+      axis.ticks.length = unit(0.5, "mm"),
+      plot.margin = ggplot2::margin(1, 1, 1, 1, unit = "mm")
+    )
+
+  return(p)
+}
+
+# -----------------------------
+# Generate + save
+# -----------------------------
+p_volcano_raw <- plot_mito_volcano_raw(mito_clone_assoc_robust)
+p_volcano_raw
+
+out_prefix <- file.path(out_dir, "mito_volcano_TCF12_vs_TCF12_2_rawp")
+
+save_png_pdf(out_prefix, p_volcano_raw, width = 5, height = 6)
+```
