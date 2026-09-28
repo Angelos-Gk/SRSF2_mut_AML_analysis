@@ -1,5 +1,6 @@
-*Single cell transcriptomic features of SRSF2 mutated AML revealed by highly multiplexed long-read genotyping* \
-This repository contains all code to reproduce the analysis from Galanopoulos *et al.* (2026)\
+***Single cell transcriptomic features of SRSF2 mutated AML revealed by highly multiplexed long-read genotyping*** \
+
+This repository contains all code to reproduce the analysis from Galanopoulos *et al.* (2026)
 
 ## Table of Contents
 **processing:** contains the scripts to preprocess the data and generate the necessary objects \
