@@ -1,0 +1,1648 @@
+---
+title: "AML1010 / AML1026 longitudinal analysis"
+output: html_document
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(tibble)
+  library(ggplot2)
+  library(ggrepel)
+  library(ggpubr)
+  library(patchwork)
+  library(scales)
+  library(scplotter)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+  library(qs2)
+})
+
+## =========================================================
+## Paths
+## =========================================================
+PROJECT_DIR <- "/path/to/project"
+FIG_DIR     <- file.path(PROJECT_DIR, "AML1010_1026/plots/figure2")
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+## =========================================================
+## Inputs
+##   - Seurat objects: AML1010/AML1026_scrna_preprocessing.R
+##   - rhPCR mutation lists: extract_mutations_AML1010/AML1026.R
+##   - mito AF/coverage matrices: aml1010_mito_tcf12_subclones.Rmd
+## =========================================================
+obj_1010 <- qs2::qs_read(file.path(PROJECT_DIR, "AML1010/objects/obj_1010_with_BoneMarrowMap_Broad_final.qs2"))
+obj_1026 <- qs2::qs_read(file.path(PROJECT_DIR, "AML1026/objects/obj_1026_with_BoneMarrowMap_Broad_final.qs2"))
+
+AML1010_rhPCR <- readRDS(file.path(PROJECT_DIR, "AML1010/objects/AML1010_rhPCRonly_mutation_data_list_inSeurat.rds"))
+AML1026_rhPCR <- readRDS(file.path(PROJECT_DIR, "AML1026/objects/AML1026_rhPCRonly_mutation_data_list_inSeurat.rds"))
+
+af_merged  <- readRDS(file.path(PROJECT_DIR, "AML1010/objects/AML1010_mito_af_merged.rds"))
+cov_merged <- readRDS(file.path(PROJECT_DIR, "AML1010/objects/AML1010_mito_cov_merged.rds"))
+min_pos_depth <- 5   # per-position mito depth to trust a call (same as the mito analysis)
+
+## =========================================================
+## Shared cell-type annotation + colors (BoneMarrowMap broad final)
+## =========================================================
+ANNOT_COL <- "BoneMarrowMap_CellType_Broad_final"
+
+celltype_colors <- c(
+  "HSCs"                  = "#d24163",
+  "GMPs"                  = "#4d8445",
+  "Lymphoid progenitors"  = "#3e2664",
+  "Erythroid progenitors" = "darkorange",
+  "Erythroid-like cells"  = "#bd7533",
+  "Monocytes"             = "#5bb94d",
+  "T-cells"               = "#8DA0CB",
+  "B-cells"               = "#A6761D",
+  "NK cells"              = "#c959ad",
+  "Dendritic cells"       = "#a1af47",
+  "Plasma cells"          = "brown",
+  "Stromal cells"         = "#A6CEE3"
+)
+```
+
+```{r UMAPs cell types and TCF12 clones}
+set.seed(42)  # random plotting order of genotyped cells
+
+geno_colors <- c(
+  "not genotyped" = "lightgrey",
+  "wildtype"      = "black",
+  "mutated"       = "firebrick"
+)
+
+# Colors for the two TCF12 clones (colorblind friendly, opposite)
+clone_colors <- c(
+  "TCF12 mut1"  = "#D55E00",   # vermillion
+  "TCF12 mut2"  = "#0072B2",   # blue
+  "both"        = "lightgrey",
+  "background"  = "lightgrey"
+)
+
+# -------------------------------------------------------
+# Shared UMAP limits
+# -------------------------------------------------------
+umap_coords <- as.data.frame(obj_1010@reductions$umap@cell.embeddings)
+colnames(umap_coords) <- c("umap_1", "umap_2")
+xlim <- range(umap_coords$umap_1) * 1.02
+ylim <- range(umap_coords$umap_2) * 1.02
+
+# -------------------------------------------------------
+# Shared theme
+# -------------------------------------------------------
+shared_theme <- list(
+  coord_fixed(xlim = xlim, ylim = ylim),
+  xlab("UMAP 1"),
+  ylab("UMAP 2"),
+  theme_classic(base_size = 6),
+  theme(
+    plot.title      = element_text(face = "bold", size = 6, hjust = 0.5),
+    plot.subtitle   = element_text(size = 4.5, hjust = 0.5, color = "grey40"),
+    axis.title      = element_text(face = "bold", size = 5),
+    axis.text       = element_blank(),
+    axis.ticks      = element_blank(),
+    axis.line       = element_line(linewidth = 0.4),
+    panel.grid      = element_blank(),
+    panel.border    = element_blank(),
+    legend.position = "none",
+    plot.margin     = margin(2, 2, 2, 2)
+  )
+)
+
+# -------------------------------------------------------
+# Plot 1: Cell type UMAP
+# -------------------------------------------------------
+p_celltype <- DimPlot(
+  obj_1010,
+  reduction = "umap",
+  group.by  = ANNOT_COL,
+  label     = FALSE,
+  raster    = FALSE,
+  pt.size   = 0.1
+) +
+  scale_color_manual(values = celltype_colors, drop = FALSE) +
+  ggtitle("Cell types") +
+  shared_theme
+
+# -------------------------------------------------------
+# Plot 2: Both TCF12 clones combined
+# -------------------------------------------------------
+all_cells <- colnames(obj_1010)
+
+get_mutated_cells <- function(geno_df, all_cells) {
+  geno_df %>%
+    dplyr::mutate(bc = as.character(bc)) %>%
+    dplyr::filter(bc %in% all_cells) %>%
+    dplyr::group_by(bc) %>%
+    dplyr::summarise(
+      is_mutated = any(mutated == "mutated"),
+      .groups    = "drop"
+    ) %>%
+    dplyr::filter(is_mutated) %>%
+    dplyr::pull(bc)
+}
+
+mut1_cells <- get_mutated_cells(AML1010_rhPCR$TCF12,   all_cells)
+mut2_cells <- get_mutated_cells(AML1010_rhPCR$TCF12_2, all_cells)
+both_cells <- intersect(mut1_cells, mut2_cells)
+
+# Assign clone labels — cells in both get "background" (lightgrey)
+clone_status <- rep("background", length(all_cells))
+names(clone_status) <- all_cells
+clone_status[mut1_cells] <- "TCF12 mut1"
+clone_status[mut2_cells] <- "TCF12 mut2"
+clone_status[both_cells] <- "both"  # overwrite with grey if in both
+
+umap_clone <- umap_coords
+umap_clone$status <- factor(clone_status[rownames(umap_clone)],
+                             levels = c("background", "both",
+                                        "TCF12 mut1", "TCF12 mut2"))
+
+# Draw background first, then colored clones randomly
+bg   <- umap_clone[umap_clone$status %in% c("background", "both"), ]
+fg   <- umap_clone[!umap_clone$status %in% c("background", "both"), ]
+fg   <- fg[sample(nrow(fg)), ]
+umap_clone_ordered <- rbind(bg, fg)
+
+n_mut1 <- length(setdiff(mut1_cells, both_cells))
+n_mut2 <- length(setdiff(mut2_cells, both_cells))
+n_both <- length(both_cells)
+
+p_clones <- ggplot(umap_clone_ordered,
+                   aes(x = umap_1, y = umap_2, color = status)) +
+  geom_point(size = 0.1, alpha = 0.8) +
+  scale_color_manual(values = clone_colors, drop = FALSE) +
+  ggtitle(label = "TCF12 clones") +
+  shared_theme
+
+# -------------------------------------------------------
+# Plots 3 & 4: Individual TCF12 mutation UMAPs
+# -------------------------------------------------------
+make_geno_umap <- function(obj, geno_df, title) {
+
+  all_cells <- colnames(obj)
+
+  status <- geno_df %>%
+    dplyr::mutate(bc = as.character(bc)) %>%
+    dplyr::filter(bc %in% all_cells) %>%
+    dplyr::group_by(bc) %>%
+    dplyr::summarise(
+      status = ifelse(any(mutated == "mutated"), "mutated", "wildtype"),
+      .groups = "drop"
+    )
+
+  cell_status <- rep("not genotyped", length(all_cells))
+  names(cell_status) <- all_cells
+  cell_status[status$bc] <- status$status
+
+  umap_df <- umap_coords
+  umap_df$status <- factor(cell_status[rownames(umap_df)],
+                            levels = c("not genotyped", "wildtype", "mutated"))
+
+  not_geno <- umap_df[umap_df$status == "not genotyped", ]
+  geno      <- umap_df[umap_df$status != "not genotyped", ]
+  geno      <- geno[sample(nrow(geno)), ]
+  umap_df   <- rbind(not_geno, geno)
+
+  n_mut <- sum(cell_status == "mutated")
+  n_wt  <- sum(cell_status == "wildtype")
+  n_ng  <- sum(cell_status == "not genotyped")
+
+  ggplot(umap_df, aes(x = umap_1, y = umap_2, color = status)) +
+    geom_point(size = 0.1, alpha = 0.8) +
+    scale_color_manual(values = geno_colors, drop = FALSE) +
+    ggtitle(label = title) +
+    shared_theme
+}
+
+p_tcf12_1 <- make_geno_umap(
+  obj     = obj_1010,
+  geno_df = AML1010_rhPCR$TCF12,
+  title   = "TCF12 mutation 1"
+)
+
+p_tcf12_2 <- make_geno_umap(
+  obj     = obj_1010,
+  geno_df = AML1010_rhPCR$TCF12_2,
+  title   = "TCF12 mutation 2"
+)
+
+# -------------------------------------------------------
+# Assemble 2x2
+# -------------------------------------------------------
+panel <- (p_celltype | p_clones) /
+         (p_tcf12_1  | p_tcf12_2)
+
+ggsave(
+  file.path(FIG_DIR, "AML1010_TCF12_2x2_UMAPs.pdf"),
+  panel,
+  width       = 9,
+  height      = 13,
+  units       = "cm",
+  useDingbats = FALSE
+)
+
+ggsave(
+  file.path(FIG_DIR, "AML1010_TCF12_2x2_UMAPs.png"),
+  panel,
+  width  = 9,
+  height = 13,
+  units  = "cm",
+  dpi    = 300,
+  bg     = "white"
+)
+
+cat("Done. Saved to", FIG_DIR, "\n")
+cat("TCF12 mut1 only:", n_mut1, "\n")
+cat("TCF12 mut2 only:", n_mut2, "\n")
+cat("Both mutations: ", n_both, "\n")
+```
+
+```{r longitudinal genotype heatmaps}
+## ============================================================
+## Longitudinal nanoRanger genotype heatmaps (4x1 per patient)
+## - One combined figure per patient (4 rows, 1 column)
+## - Each row = one timepoint heatmap (genotyped cells only)
+## - Targets (rows) kept stable across timepoints
+## - Columns split by BoneMarrowMap broad cell types
+## - Outputs BOTH PNG + PDF
+## - Fixes vertical stacking issues by drawing each heatmap directly into a panel viewport
+## - Adds explicit right margin to prevent right-edge clipping
+## - Drops specified targets ONLY for AML1010: E2F3, BMPR1A
+## ============================================================
+
+stopifnot(
+  exists("AML1010_rhPCR"), exists("AML1026_rhPCR"),
+  exists("obj_1010"), exists("obj_1026")
+)
+
+## -------------------------
+## SETTINGS
+## -------------------------
+OUTDIR <- file.path(FIG_DIR, "longitudinal_heatmaps_4x1")
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+
+dpi <- 300
+
+# How tall each target-row should be within each heatmap (mm)
+row_height_mm <- 4.5
+
+# Overall extra space (mm) handled via explicit layout params below
+figure_margin_mm <- 45
+
+# Right-side breathing room to prevent “last columns” cropping (mm)
+right_margin_mm <- 10
+
+# genotype colors
+state_cols <- c("mutated" = "firebrick", "wildtype" = "white")
+na_color <- "grey85"
+
+# annotation column to use from Seurat
+CELLTYPE_COL <- ANNOT_COL
+
+# omit specific targets per patient (rows in the heatmap)
+drop_targets_by_patient <- list(
+  AML1010 = c("E2F3", "BMPR1A"),
+  AML1026 = character(0)
+)
+
+## -------------------------
+## Celltype labels + order (colors: celltype_colors from setup)
+## -------------------------
+rename_final_anno <- function(x) as.character(x)
+
+# Differentiation-based order (stable across patients)
+celltype_order <- c(
+  "HSCs",
+  "Erythroid progenitors",
+  "Erythroid-like cells",
+  "GMPs",
+  "Monocytes",
+  "Lymphoid progenitors",
+  "T-cells",
+  "B-cells",
+  "NK cells",
+  "Dendritic cells",
+  "Plasma cells",
+  "Stromal cells"
+)
+
+## -------------------------
+## Helpers
+## -------------------------
+expand_to_rows <- function(mat, all_rows) {
+  m <- matrix(
+    NA_character_,
+    nrow = length(all_rows),
+    ncol = ncol(mat),
+    dimnames = list(all_rows, colnames(mat))
+  )
+  common <- intersect(rownames(mat), all_rows)
+  if (length(common) > 0) m[common, ] <- mat[common, , drop = FALSE]
+  m
+}
+
+# deterministic fallback for missing celltype colors
+make_celltype_color_map <- function(celltypes, base_map) {
+  celltypes <- unique(celltypes)
+  out <- base_map
+  missing <- setdiff(celltypes, names(out))
+  if (length(missing) > 0) {
+    extra_cols <- circlize::rand_color(length(missing), luminosity = "bright")
+    names(extra_cols) <- missing
+    out <- c(out, extra_cols)
+  }
+  out[celltypes]
+}
+
+# build genotype matrix for a single timepoint
+# rows=targets, cols=cells, values = mutated/wildtype/NA
+build_genotype_matrix_timepoint <- function(seurat_obj,
+                                            nano_list,
+                                            sample_name,
+                                            celltype_col = ANNOT_COL,
+                                            row_order_ref = NULL,
+                                            drop_targets = character(0)) {
+
+  md <- seurat_obj@meta.data
+  stopifnot(celltype_col %in% colnames(md))
+
+  # Seurat cells for this timepoint: "AML1010.1_..." etc
+  sample_cells <- rownames(md)[startsWith(rownames(md), paste0(sample_name, "_"))]
+  if (length(sample_cells) == 0) stop(sprintf("No Seurat cells found for '%s'.", sample_name))
+
+  cell_anno <- md[sample_cells, celltype_col, drop = TRUE]
+  cell_anno <- rename_final_anno(cell_anno)
+
+  # keep targets that have any rows for this timepoint
+  keep_targets <- names(nano_list)[purrr::map_lgl(nano_list, function(df) {
+    "sample_name" %in% colnames(df) && any(df$sample_name == sample_name)
+  })]
+
+  # drop requested targets (patient-specific)
+  if (length(drop_targets) > 0) {
+    keep_targets <- setdiff(keep_targets, drop_targets)
+  }
+
+  if (length(keep_targets) == 0) stop(sprintf("No nanoRanger targets for '%s' after dropping targets.", sample_name))
+
+  # Build matrix
+  mat <- matrix(
+    NA_character_,
+    nrow = length(keep_targets),
+    ncol = length(sample_cells),
+    dimnames = list(keep_targets, sample_cells)
+  )
+
+  for (i in seq_along(keep_targets)) {
+    df <- nano_list[[keep_targets[i]]]
+    df <- df[df$sample_name == sample_name, c("bc", "mutated"), drop = FALSE]
+    df <- df[df$bc %in% sample_cells, , drop = FALSE]
+
+    if (nrow(df) > 0) {
+      df$mutated <- ifelse(df$mutated == "mutated", "mutated",
+                           ifelse(df$mutated == "wildtype", "wildtype", NA))
+      state_vec <- setNames(df$mutated, df$bc)
+      mat[i, names(state_vec)] <- state_vec
+    }
+  }
+
+  # Clean
+  mat[] <- as.character(mat)
+  mat[!(mat %in% c("mutated", "wildtype"))] <- NA_character_
+
+  # Keep only genotyped cells
+  keep_cols <- colSums(!is.na(mat)) > 0
+  if (!any(keep_cols)) stop(sprintf("No genotyped cells for '%s'.", sample_name))
+  mat <- mat[, keep_cols, drop = FALSE]
+
+  # Refresh annotation to genotyped columns + rename
+  sample_cells <- colnames(mat)
+  cell_anno <- md[sample_cells, celltype_col, drop = TRUE]
+  cell_anno <- rename_final_anno(cell_anno)
+
+  # ROW ORDER
+  if (is.null(row_order_ref)) {
+    mut_counts  <- rowSums(mat == "mutated", na.rm = TRUE)
+    geno_counts <- rowSums(!is.na(mat))
+    mat <- mat[order(-mut_counts, -geno_counts), , drop = FALSE]
+    row_order_out <- rownames(mat)
+  } else {
+    common <- intersect(row_order_ref, rownames(mat))
+    extra  <- setdiff(rownames(mat), row_order_ref)
+
+    if (length(extra) > 0) {
+      mut_extra  <- rowSums(mat[extra, , drop = FALSE] == "mutated", na.rm = TRUE)
+      geno_extra <- rowSums(!is.na(mat[extra, , drop = FALSE]))
+      extra <- extra[order(-mut_extra, -geno_extra)]
+    }
+
+    mat <- mat[c(common, extra), , drop = FALSE]
+    row_order_out <- rownames(mat)
+  }
+
+  # COLUMN ORDER: by row-wise state priority + celltype + original
+  state_priority <- function(x) ifelse(x == "mutated", 1L, ifelse(x == "wildtype", 2L, 3L))
+
+  ct_levels <- intersect(celltype_order, unique(cell_anno))
+  if (length(ct_levels) == 0) ct_levels <- unique(cell_anno)
+
+  pr_list <- lapply(seq_len(nrow(mat)), function(i) state_priority(mat[i, ]))
+  pr_list[[length(pr_list) + 1]] <- as.integer(factor(cell_anno, levels = ct_levels))
+  pr_list[[length(pr_list) + 1]] <- seq_along(colnames(mat))
+  col_ord <- do.call(order, pr_list)
+
+  mat <- mat[, col_ord, drop = FALSE]
+  cell_anno <- cell_anno[col_ord]
+
+  list(mat = mat, row_order = row_order_out, cell_anno = cell_anno)
+}
+
+infer_timepoints <- function(seurat_obj, pid) {
+  all_cells <- colnames(seurat_obj)
+  tp <- str_extract(all_cells, paste0("^", pid, "\\.[0-9]+"))
+  sort(unique(tp[!is.na(tp)]))
+}
+
+# Save BOTH PNG and PDF using identical drawing code
+save_png_pdf <- function(prefix, width_in, height_in, dpi, draw_fun) {
+
+  ## PNG
+  png(
+    filename = paste0(prefix, ".png"),
+    width  = width_in * dpi,
+    height = height_in * dpi,
+    res    = dpi,
+    type   = "cairo-png"
+  )
+  tryCatch(draw_fun(), finally = dev.off())
+
+  ## PDF
+  pdf(
+    file = paste0(prefix, ".pdf"),
+    width  = width_in,
+    height = height_in,
+    useDingbats = FALSE
+  )
+  tryCatch(draw_fun(), finally = dev.off())
+}
+
+## -------------------------
+## Optional legend styling
+## -------------------------
+ComplexHeatmap::ht_opt(
+  legend_title_gp  = gpar(fontsize = 9),
+  legend_labels_gp = gpar(fontsize = 8),
+  legend_grid_width  = unit(3, "mm"),
+  legend_grid_height = unit(3, "mm")
+)
+
+## -------------------------
+## Main: one 4x1 figure per patient
+## -------------------------
+patients <- list(
+  AML1010 = list(seurat = obj_1010, nano = AML1010_rhPCR),
+  AML1026 = list(seurat = obj_1026, nano = AML1026_rhPCR)
+)
+
+for (pid in names(patients)) {
+
+  message("\n==== Processing patient: ", pid, " ====")
+
+  seurat_obj <- patients[[pid]]$seurat
+  nano_list  <- patients[[pid]]$nano
+
+  timepoints <- infer_timepoints(seurat_obj, pid)
+  if (length(timepoints) == 0) {
+    warning("No timepoints found for ", pid)
+    next
+  }
+
+  # Keep at most 4 (sorted)
+  if (length(timepoints) > 4) timepoints <- timepoints[1:4]
+  message("Timepoints used: ", paste(timepoints, collapse = ", "))
+
+  ## Build matrices first, then harmonize rows across timepoints
+  res_list <- list()
+  row_order_ref <- NULL
+
+  for (sname in timepoints) {
+    message("  -> building matrix for ", sname)
+
+    res <- build_genotype_matrix_timepoint(
+      seurat_obj    = seurat_obj,
+      nano_list     = nano_list,
+      sample_name   = sname,
+      celltype_col  = CELLTYPE_COL,
+      row_order_ref = row_order_ref,
+      drop_targets  = drop_targets_by_patient[[pid]]
+    )
+
+    if (is.null(row_order_ref)) row_order_ref <- res$row_order
+    res_list[[sname]] <- res
+  }
+
+  # Common row set: reference first, then any late-appearing targets
+  all_rows <- row_order_ref
+  for (sname in names(res_list)) {
+    all_rows <- unique(c(all_rows, res_list[[sname]]$row_order))
+  }
+
+  # Heatmap height per panel (same across panels because rows harmonized)
+  heatmap_height_mm <- length(all_rows) * row_height_mm
+
+  ## Cell types present across all plotted timepoints (for shared legend)
+  ct_present <- unique(unlist(lapply(res_list, function(x) x$cell_anno)))
+  ct_present <- intersect(celltype_order, ct_present)
+  if (length(ct_present) == 0) ct_present <- unique(unlist(lapply(res_list, function(x) x$cell_anno)))
+  ct_col_map_global <- make_celltype_color_map(ct_present, celltype_colors)
+
+  ## Shared legends
+  genotype_lgd <- Legend(
+    title = "Genotype",
+    at = c("Wildtype", "Mutated", "Unknown"),
+    legend_gp = gpar(fill = c("white", "firebrick", na_color)),
+    nrow = 1,
+    direction = "horizontal",
+    grid_width  = unit(3, "mm"),
+    grid_height = unit(3, "mm"),
+    labels_gp = gpar(fontsize = 8),
+    title_gp  = gpar(fontsize = 9),
+    border = "black"
+  )
+
+  celltype_lgd <- Legend(
+    title = "Cell type",
+    at = ct_present,
+    legend_gp = gpar(fill = ct_col_map_global[ct_present]),
+    nrow = 1,
+    direction = "horizontal",
+    grid_width  = unit(3, "mm"),
+    grid_height = unit(3, "mm"),
+    labels_gp = gpar(fontsize = 8),
+    title_gp  = gpar(fontsize = 9),
+    border = "black"
+  )
+
+  # packLegend returns a grob-like object; use grid.draw() (NOT ComplexHeatmap::draw())
+  legends_obj <- packLegend(celltype_lgd, genotype_lgd, direction = "vertical")
+
+  ## Pre-build heatmap objects (one per timepoint)
+  ht_list <- list()
+
+  for (sname in timepoints) {
+
+    mat <- expand_to_rows(res_list[[sname]]$mat, all_rows)
+    ct  <- res_list[[sname]]$cell_anno
+    n_geno <- ncol(mat)
+
+    # column split by cell type (ordered)
+    ct_levels <- intersect(celltype_order, unique(ct))
+    if (length(ct_levels) == 0) ct_levels <- unique(ct)
+    column_split <- factor(ct, levels = ct_levels)
+
+    # color map for this panel
+    ct_col_map_panel <- make_celltype_color_map(ct_levels, celltype_colors)
+
+    ha <- HeatmapAnnotation(
+      Cell_type = anno_simple(
+        x      = ct,
+        col    = ct_col_map_panel,
+        border = TRUE,
+        height = unit(4, "mm")
+      ),
+      which = "column",
+      show_annotation_name = FALSE,
+      show_legend = FALSE
+    )
+
+    row_gp <- gpar(fontsize = 8, fontface = "italic", col = "black")
+    row_width <- ComplexHeatmap::max_text_width(all_rows, gp = row_gp)
+
+    ht_list[[sname]] <- Heatmap(
+      mat,
+      name = paste0("Genotype_", sname),
+      col = state_cols,
+      na_col = na_color,
+      cluster_rows = FALSE,
+      cluster_columns = FALSE,
+      show_row_names = TRUE,
+      show_column_names = FALSE,
+      row_names_gp = row_gp,
+      row_names_side = "left",
+      row_names_max_width = row_width,
+      top_annotation = ha,
+      column_split = column_split,
+      column_title = sprintf("%s (%d genotyped cells)", sname, n_geno),
+      column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+      column_gap = unit(2, "mm"),
+      row_gap = unit(1, "mm"),
+      rect_gp = gpar(col = NA),
+      border = TRUE,
+      use_raster = TRUE,
+      raster_quality = 6,
+      height = unit(heatmap_height_mm, "mm"),
+      show_heatmap_legend = FALSE
+    )
+  }
+
+  ## -------------------------
+  ## Output sizing (tuned to avoid cropping)
+  ## -------------------------
+  # Extra per-panel space to accommodate: column title + annotation strip + padding
+  panel_extra_mm <- 22  # increase to 26 if you still see clipping
+  panel_height_mm <- heatmap_height_mm + panel_extra_mm
+
+  # Layout heights
+  title_mm   <- 10
+  legend_mm  <- 34
+  outer_mm   <- 10
+
+  total_height_mm <- title_mm + length(ht_list) * panel_height_mm + legend_mm + outer_mm
+  height_in <- total_height_mm / 25.4
+
+  # Add explicit right margin to avoid right-edge clipping
+  width_in_base <- 13
+  width_in <- width_in_base + (right_margin_mm / 25.4)
+
+  out_prefix <- file.path(OUTDIR, paste0(pid, "_longitudinal_heatmaps_4x1"))
+
+  ## One drawing function used for BOTH devices (PNG + PDF)
+  draw_fun <- function() {
+
+    grid.newpage()
+
+    n_panels <- length(ht_list)
+
+    lay <- grid.layout(
+      nrow = 1 + n_panels + 1,
+      ncol = 2,
+      heights = unit.c(
+        unit(title_mm, "mm"),
+        rep(unit(panel_height_mm, "mm"), n_panels),
+        unit(legend_mm, "mm")
+      ),
+      widths = unit.c(
+        unit(1, "null"),
+        unit(right_margin_mm, "mm")
+      )
+    )
+
+    pushViewport(viewport(layout = lay))
+
+    ## Title
+    pushViewport(viewport(layout.pos.row = 1, layout.pos.col = 1))
+    grid.text(
+      paste0(pid, " : longitudinal genotype heatmaps (rhPCR)"),
+      gp = gpar(fontsize = 15, fontface = "bold")
+    )
+    popViewport()
+
+    ## Panels
+    panel_names <- names(ht_list)
+    for (i in seq_along(panel_names)) {
+
+      pushViewport(viewport(
+        layout.pos.row = 1 + i,
+        layout.pos.col = 1,
+        clip = "off"
+      ))
+
+      ComplexHeatmap::draw(
+        ht_list[[panel_names[i]]],
+        newpage = FALSE,
+        show_heatmap_legend = FALSE,
+        show_annotation_legend = FALSE,
+        padding = unit(c(2, 6, 2, 2), "mm")
+      )
+
+      popViewport()
+    }
+
+    ## Legends
+    pushViewport(viewport(layout.pos.row = 1 + n_panels + 1, layout.pos.col = 1))
+    grid.draw(legends_obj)
+    popViewport()
+
+    popViewport()
+  }
+
+  ## Save BOTH PNG and PDF
+  save_png_pdf(
+    prefix    = out_prefix,
+    width_in  = width_in,
+    height_in = height_in,
+    dpi       = dpi,
+    draw_fun  = draw_fun
+  )
+
+  message("✅ Saved: ", out_prefix, ".png")
+  message("✅ Saved: ", out_prefix, ".pdf")
+}
+```
+
+```{r genotyped cells, cell-type composition, mutation frequencies}
+stopifnot(
+  exists("obj_1010"), exists("obj_1026"),
+  exists("AML1010_rhPCR"), exists("AML1026_rhPCR")
+)
+
+OUTDIR <- file.path(FIG_DIR, "combined_panel_figure")
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+
+EXCLUDE_CT <- c("T-cells", "NK cells")
+
+# ============================================================
+# SHARED DEFINITIONS
+# ============================================================
+tp_labels_raw <- list(
+  AML1010 = c("AML1010.1" = "Screening", "AML1010.3" = "C1",
+               "AML1010.4" = "C4",        "AML1010.5" = "C10"),
+  AML1026 = c("AML1026.1" = "Screening", "AML1026.2" = "DEC",
+               "AML1026.3" = "C1",        "AML1026.4" = "EOT")
+)
+
+tp_labels_barplot <- list(
+  AML1010 = c("AML1010.1" = "TP1", "AML1010.3" = "TP2",
+               "AML1010.4" = "TP3", "AML1010.5" = "TP4"),
+  AML1026 = c("AML1026.1" = "TP1", "AML1026.2" = "TP2",
+               "AML1026.3" = "TP3", "AML1026.4" = "TP4")
+)
+
+tp_order <- list(
+  AML1010 = c("Screening", "C1", "C4", "C10"),
+  AML1026 = c("Screening", "DEC", "C1", "EOT")
+)
+
+celltype_order <- c(
+  "HSCs", "GMPs", "Lymphoid progenitors", "Erythroid-like cells",
+  "Erythroid progenitors", "Monocytes", "T-cells", "B-cells",
+  "NK cells", "Dendritic cells", "Plasma cells", "Stromal cells"
+)
+
+class_colors <- c(
+  "Recurrent"     = "#0072B2",
+  "Non-recurrent" = "#E69F00",
+  "Total"         = "#009E73"
+)
+
+recurrent_by_case <- list(
+  AML1010 = c("NRAS"),
+  AML1026 = c("NRAS", "SF3B1", "SRSF2")
+)
+
+# ============================================================
+# PART 1 — BARPLOTS
+# ============================================================
+count_genotyped <- function(rhpcr_list, recurrent_genes, patient_id, tp_label_map) {
+  purrr::imap_dfr(rhpcr_list, function(df, gene) {
+    mut_class <- if (gene %in% recurrent_genes) "Recurrent" else "Non-recurrent"
+    df %>%
+      dplyr::select(bc, sample_name) %>%
+      dplyr::distinct() %>%
+      dplyr::mutate(mutation_class = mut_class)
+  }) %>%
+    dplyr::distinct(bc, sample_name, mutation_class) %>%
+    dplyr::count(sample_name, mutation_class, name = "n_cells") %>%
+    dplyr::mutate(
+      patient   = patient_id,
+      timepoint = tp_label_map[sample_name]
+    )
+}
+
+count_genotyped_total <- function(rhpcr_list, patient_id, tp_label_map) {
+  purrr::imap_dfr(rhpcr_list, function(df, gene) {
+    df %>%
+      dplyr::select(bc, sample_name) %>%
+      dplyr::distinct()
+  }) %>%
+    dplyr::distinct(bc, sample_name) %>%
+    dplyr::count(sample_name, name = "n_cells") %>%
+    dplyr::mutate(
+      patient        = patient_id,
+      timepoint      = tp_label_map[sample_name],
+      mutation_class = "Total"
+    )
+}
+
+df_bar_1010     <- count_genotyped(AML1010_rhPCR, recurrent_by_case$AML1010,
+                                    "AML1010", tp_labels_barplot$AML1010)
+df_bar_1026     <- count_genotyped(AML1026_rhPCR, recurrent_by_case$AML1026,
+                                    "AML1026", tp_labels_barplot$AML1026)
+df_bar_1010_tot <- count_genotyped_total(AML1010_rhPCR, "AML1010",
+                                          tp_labels_barplot$AML1010)
+df_bar_1026_tot <- count_genotyped_total(AML1026_rhPCR, "AML1026",
+                                          tp_labels_barplot$AML1026)
+
+plot_df <- dplyr::bind_rows(
+  df_bar_1010, df_bar_1026, df_bar_1010_tot, df_bar_1026_tot
+) %>%
+  dplyr::mutate(
+    timepoint      = factor(timepoint, levels = c("TP1", "TP2", "TP3", "TP4")),
+    mutation_class = factor(mutation_class,
+                             levels = c("Recurrent", "Non-recurrent", "Total"))
+  )
+
+make_barplot <- function(pid, is_right_col = FALSE) {
+  ggplot(
+    plot_df %>% dplyr::filter(patient == pid),
+    aes(x = timepoint, y = n_cells, fill = mutation_class)
+  ) +
+    geom_col(
+      position  = position_dodge(width = 0.8),
+      width     = 0.7,
+      color     = "black",
+      linewidth = 0.3
+    ) +
+    scale_fill_manual(values = class_colors, name = "Mutation class") +
+    scale_y_continuous(
+      name   = if (is_right_col) NULL else "Genotyped cells",
+      expand = expansion(mult = c(0, 0.15))
+    ) +
+    scale_x_discrete(name = NULL) +
+    ggtitle(pid) +
+    theme_classic(base_size = 7) +
+    theme(
+      plot.title        = element_text(face = "bold", size = 8, hjust = 0.5),
+      strip.background  = element_blank(),
+      strip.text        = element_text(face = "bold", size = 8),
+      legend.position   = "none",
+      axis.title.y      = if (is_right_col) element_blank() else element_text(),
+      axis.line         = element_line(linewidth = 0.3),
+      axis.ticks        = element_line(linewidth = 0.3),
+      axis.ticks.length = unit(1.5, "mm"),
+      plot.margin       = if (is_right_col) margin(2, 2, 1, 0, "mm") else
+                                            margin(2, 2, 1, 2, "mm")
+    )
+}
+
+p_bar_1010 <- make_barplot("AML1010", is_right_col = FALSE)
+p_bar_1026 <- make_barplot("AML1026", is_right_col = TRUE)
+
+# ============================================================
+# PART 2 — AREA PLOTS
+# ============================================================
+make_area_plot <- function(seurat_obj, pid, is_right_col = FALSE) {
+  md <- seurat_obj@meta.data
+  md$timepoint <- unname(tp_labels_raw[[pid]][
+    str_extract(rownames(md), paste0("^", pid, "\\.[0-9]+"))
+  ])
+  md$celltype_renamed <- factor(
+    as.character(md[[ANNOT_COL]]),
+    levels = celltype_order
+  )
+  seurat_obj@meta.data <- md
+  seurat_obj <- subset(
+    seurat_obj,
+    cells = rownames(md)[!is.na(md$timepoint)]
+  )
+  seurat_obj$timepoint <- factor(
+    seurat_obj$timepoint,
+    levels = tp_order[[pid]]
+  )
+  Idents(seurat_obj) <- "celltype_renamed"
+
+  colors       <- celltype_colors
+  present      <- levels(droplevels(seurat_obj$celltype_renamed))
+  missing_cols <- setdiff(present, names(colors))
+  if (length(missing_cols) > 0) {
+    extra <- circlize::rand_color(length(missing_cols), luminosity = "bright")
+    names(extra) <- missing_cols
+    colors <- c(colors, extra)
+  }
+
+  CellStatPlot(
+    seurat_obj,
+    ident        = "celltype_renamed",
+    group_by     = "timepoint",
+    plot_type    = "area",
+    frac         = "group",
+    palcolor     = colors,
+    x_text_angle = 45,
+    ylab         = "Fraction of cells",
+    title        = pid
+  ) +
+    scale_fill_manual(values = colors, drop = FALSE) +
+    theme_classic(base_size = 7) +
+    theme(
+      legend.position = "none",
+      plot.title      = element_blank(),
+      axis.title.x    = element_blank(),
+      axis.title.y    = if (is_right_col) element_blank() else element_text(),
+      axis.text.x     = element_blank(),
+      axis.ticks.x    = element_blank(),
+      plot.margin     = if (is_right_col) margin(2, 2, 1, 0, "mm") else
+                                          margin(2, 2, 1, 2, "mm")
+    )
+}
+
+p_area_1010 <- make_area_plot(obj_1010, "AML1010", is_right_col = FALSE)
+p_area_1026 <- make_area_plot(obj_1026, "AML1026", is_right_col = TRUE)
+
+# ============================================================
+# PART 3 — LINEPLOTS
+# ============================================================
+allowed_barcodes <- function(seurat_obj) {
+  md <- seurat_obj@meta.data
+  rownames(md)[!(as.character(md[[ANNOT_COL]]) %in% EXCLUDE_CT)]
+}
+
+summarise_mutfreq <- function(nano_list, pid_prefix, keep_barcodes) {
+  purrr::imap_dfr(nano_list, function(df, target_name) {
+    df %>%
+      dplyr::mutate(
+        target  = target_name,
+        mutated = as.character(mutated),
+        mutated = ifelse(mutated %in% c("mutated", "wildtype"),
+                         mutated, NA_character_)
+      ) %>%
+      dplyr::filter(
+        !is.na(mutated),
+        stringr::str_starts(sample_name, pid_prefix),
+        bc %in% keep_barcodes
+      ) %>%
+      dplyr::group_by(target, sample_name) %>%
+      dplyr::summarise(
+        n_genotyped = dplyr::n(),
+        n_mutated   = sum(mutated == "mutated"),
+        freq        = ifelse(n_genotyped > 0,
+                             n_mutated / n_genotyped, NA_real_),
+        .groups     = "drop"
+      )
+  }) %>%
+    dplyr::mutate(
+      timepoint = unname(tp_labels_raw[[pid_prefix]][sample_name])
+    ) %>%
+    dplyr::filter(!is.na(timepoint))
+}
+
+make_lineplot <- function(df, pid, highlight_targets, label_targets,
+                          highlight_colors, drop_targets = character(0),
+                          y_limit_max, y_breaks, is_right_col = FALSE) {
+  df <- df %>%
+    dplyr::filter(!target %in% drop_targets) %>%
+    dplyr::mutate(
+      timepoint = factor(timepoint, levels = tp_order[[pid]]),
+      group     = "Stable mutations"
+    )
+  if (length(highlight_targets) > 0) {
+    df <- df %>%
+      dplyr::mutate(
+        group = ifelse(target %in% names(highlight_targets),
+                       unname(highlight_targets[target]), group)
+      )
+  }
+  col_map <- c("Stable mutations" = "grey70", highlight_colors)
+  col_map <- col_map[!duplicated(names(col_map))]
+
+  p <- ggplot(df, aes(x = timepoint, y = freq, group = target)) +
+    geom_line(aes(color  = group), linewidth = 0.4) +
+    geom_point(aes(color = group), size = 0.8) +
+    scale_x_discrete(expand = c(0, 0.1)) +
+    scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      breaks = y_breaks,
+      limits = c(0, y_limit_max)
+    ) +
+    scale_color_manual(values = col_map, drop = FALSE) +
+    labs(
+      x     = NULL,
+      y     = if (is_right_col) NULL else "Mutation frequency",
+      color = NULL
+    ) +
+    theme_classic(base_size = 7) +
+    theme(
+      axis.text.x     = element_text(size = 7),
+      axis.text.y     = element_text(size = 7),
+      axis.title.y    = if (is_right_col) element_blank() else element_text(size = 7),
+      legend.position = "none",
+      plot.margin     = if (is_right_col) margin(1, 2, 2, 0, "mm") else
+                                          margin(1, 2, 2, 2, "mm")
+    )
+
+  if (length(label_targets) > 0) {
+    last_tp <- tail(levels(df$timepoint), 1)
+    df_lab  <- df %>%
+      dplyr::filter(target %in% label_targets,
+                    timepoint == last_tp) %>%
+      dplyr::mutate(label = target)
+    p <- p +
+      ggrepel::geom_text_repel(
+        data               = df_lab,
+        aes(label          = label),
+        nudge_x            = 0.2,
+        direction          = "y",
+        hjust              = 0,
+        segment.size       = 0.3,
+        size               = 2,
+        min.segment.length = 0,
+        max.overlaps       = Inf
+      ) +
+      coord_cartesian(clip = "off")
+  }
+  p
+}
+
+df_1010 <- summarise_mutfreq(AML1010_rhPCR, "AML1010",
+                              allowed_barcodes(obj_1010))
+df_1026 <- summarise_mutfreq(AML1026_rhPCR, "AML1026",
+                              allowed_barcodes(obj_1026))
+
+highlight_1010 <- c(
+  "TCF12"   = "TCF12^E53fs clone",
+  "TCF12_2" = "TCF12^S358fs clone",
+  "RNPEPL1" = "RNPEPL1",
+  "ACIN1"   = "ACIN1",
+  "C4orf33" = "C4orf33",
+  "CYFIP2"  = "CYFIP2"
+)
+highlight_cols_1010 <- c(
+  "TCF12^S358fs clone" = "blue3",
+  "RNPEPL1"            = "blue3",
+  "TCF12^E53fs clone"  = "firebrick3",
+  "ACIN1"              = "firebrick3",
+  "C4orf33"            = "firebrick3",
+  "CYFIP2"             = "firebrick3"
+)
+
+highlight_1026 <- c(
+  "SF3B1"   = "SF3B1",
+  "CSNK1D"  = "CSNK1D",
+  "CCDC88B" = "CCDC88B",
+  "LPGAT1"  = "LPGAT1"
+)
+highlight_cols_1026 <- c(
+  "SF3B1"   = "orange",
+  "CSNK1D"  = "orange",
+  "CCDC88B" = "orange",
+  "LPGAT1"  = "orange"
+)
+
+y_max_shared    <- ceiling(
+  max(c(df_1010$freq, df_1026$freq), na.rm = TRUE) * 20) / 20
+y_breaks_shared <- seq(0, y_max_shared, by = 0.2)
+
+p_line_1010 <- make_lineplot(
+  df                = df_1010,
+  pid               = "AML1010",
+  highlight_targets = highlight_1010,
+  label_targets     = names(highlight_1010),
+  highlight_colors  = highlight_cols_1010,
+  drop_targets      = c("BMPR1A", "E2F3", "SPNS1"),
+  y_limit_max       = y_max_shared,
+  y_breaks          = y_breaks_shared,
+  is_right_col      = FALSE
+)
+
+p_line_1026 <- make_lineplot(
+  df                = df_1026,
+  pid               = "AML1026",
+  highlight_targets = highlight_1026,
+  label_targets     = names(highlight_1026),
+  highlight_colors  = highlight_cols_1026,
+  y_limit_max       = y_max_shared,
+  y_breaks          = y_breaks_shared,
+  is_right_col      = TRUE
+)
+
+# ============================================================
+# PART 4 — ASSEMBLE
+# ============================================================
+fig_combined <- (p_bar_1010  | p_bar_1026)  /
+                (p_area_1010 | p_area_1026) /
+                (p_line_1010 | p_line_1026) +
+  plot_layout(heights = c(0.5, 0.6, 0.8))
+
+# ============================================================
+# SAVE
+# ============================================================
+ggsave(
+  filename = file.path(OUTDIR, "combined_panel_figure_3rows.pdf"),
+  plot     = fig_combined,
+  width    = 10.5,
+  height   = 13,
+  units    = "cm",
+  device   = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(OUTDIR, "combined_panel_figure_3rows.png"),
+  plot     = fig_combined,
+  width    = 10.5,
+  height   = 13,
+  units    = "cm",
+  dpi      = 300
+)
+
+message("Done. Saved to: ", OUTDIR)
+```
+
+```{r DE volcano TCF12_1 vs TCF12_2}
+## ============================================================
+## Volcano DE: TCF12_1 clone vs TCF12_2 clone
+## - Uses Seurat object: obj_1010 (change if needed)
+## - Uses nanoRanger list: AML1010_rhPCR (targets like "TCF12", "TCF12_2")
+## - Subsets by BoneMarrowMap compartments using:
+##     BoneMarrowMap_CellType_Broad_final
+##   keeping ONLY:
+##     HSCs, GMPs, Lymphoid progenitors, Erythroid progenitors
+## - Assigns each cell to:
+##     * "TCF12_1" (mutated for TCF12, NOT mutated for TCF12_2)
+##     * "TCF12_2" (mutated for TCF12_2, NOT mutated for TCF12)
+##   (cells mutated for BOTH are removed; all others dropped from DE)
+## - Runs FindMarkers(Wilcoxon), makes volcano plot, saves PDF+PNG+CSV
+## - Plot is fixed at 5 cm (w) x 6 cm (h); fonts scaled down to avoid
+##   smudging/clipping at that size; legend dropped (see note below)
+## ============================================================
+
+stopifnot(exists("obj_1010"), exists("AML1010_rhPCR"))
+
+## -------------------------
+## SETTINGS YOU MAY EDIT
+## -------------------------
+PID <- "AML1010"
+obj <- obj_1010
+nano_list <- AML1010_rhPCR
+
+stopifnot(ANNOT_COL %in% colnames(obj@meta.data))
+
+relevant_compartments <- c(
+  "HSCs",
+  "GMPs",
+  "Lymphoid progenitors",
+  "Erythroid progenitors"
+)
+
+out_prefix <- file.path(FIG_DIR, paste0("Volcano_TCF12_1_vs_TCF12_2_", PID, "_BMMapBroadFinal"))
+
+p_cutoff  <- 0.05
+fc_cutoff <- 1
+
+genes_to_label <- c(
+  "SELL", "APP", "CAVIN1", "HIST3H2A", "LGALS1", "FAM171A1", "OVCH1-AS1", "POU4F1",
+  "CDKN2A", "HLA-DQB1", "HLA-DQA1", "HNRNPLL", "USP44", "TUSC1",
+  "RNF217", "SPOCK3", "CCDC8", "HLA-DQA2"
+)
+
+## -------------------------
+## Helpers
+## -------------------------
+
+get_bc_status_from_nano <- function(nano_list, target_name, allowed_cells) {
+  if (!target_name %in% names(nano_list)) {
+    stop(
+      "Target '", target_name, "' not found in nano_list. Available targets include e.g.: ",
+      paste(head(names(nano_list), 20), collapse = ", "), " ..."
+    )
+  }
+
+  df <- nano_list[[target_name]]
+
+  req <- c("bc", "mutated")
+  if (!all(req %in% colnames(df))) {
+    stop(
+      "nano_list[['", target_name, "']] must contain columns: ",
+      paste(req, collapse = ", "),
+      ". Found: ", paste(colnames(df), collapse = ", ")
+    )
+  }
+
+  df <- df %>%
+    dplyr::select(bc, mutated) %>%
+    dplyr::filter(bc %in% allowed_cells)
+
+  # Collapse duplicate bc:
+  # call mutated if ANY mutated row exists; else wildtype
+  df <- df %>%
+    dplyr::group_by(bc) %>%
+    dplyr::summarise(
+      mutated = dplyr::case_when(
+        any(mutated == "mutated")  ~ "mutated",
+        any(mutated == "wildtype") ~ "wildtype",
+        TRUE ~ NA_character_
+      ),
+      .groups = "drop"
+    )
+
+  stats <- df$mutated
+  names(stats) <- df$bc
+  stats
+}
+
+save_png_pdf <- function(prefix, plot, width = 5, height = 6, units = "cm", dpi = 600) {
+  ggplot2::ggsave(paste0(prefix, ".png"), plot = plot, width = width, height = height, units = units, dpi = dpi)
+  ggplot2::ggsave(paste0(prefix, ".pdf"), plot = plot, width = width, height = height, units = units, device = cairo_pdf)
+}
+
+## -------------------------
+## 1) Subset to BMMap compartments
+## -------------------------
+md <- obj@meta.data
+
+subset_cells <- rownames(md)[as.character(md[[ANNOT_COL]]) %in% relevant_compartments]
+if (length(subset_cells) == 0) {
+  stop(
+    "No cells matched relevant compartments in ", ANNOT_COL, ": ",
+    paste(relevant_compartments, collapse = ", ")
+  )
+}
+
+# IMPORTANT: use subset() directly (S3 method), NOT Seurat::subset()
+subset_obj <- subset(obj, cells = subset_cells)
+
+message("BMMap compartment counts in subset:")
+print(table(subset_obj@meta.data[[ANNOT_COL]], useNA = "ifany"))
+
+## -------------------------
+## 2) Build clone assignment from TCF12 vs TCF12_2
+## -------------------------
+TCF12_1_target <- "TCF12"
+TCF12_2_target <- "TCF12_2"
+
+allowed <- rownames(subset_obj@meta.data)
+
+t1_status <- get_bc_status_from_nano(nano_list, TCF12_1_target, allowed_cells = allowed)
+t2_status <- get_bc_status_from_nano(nano_list, TCF12_2_target, allowed_cells = allowed)
+
+subset_obj$TCF12_clone <- NA_character_
+
+mut_t1 <- names(t1_status)[t1_status == "mutated"]
+mut_t2 <- names(t2_status)[t2_status == "mutated"]
+
+mut_both <- base::intersect(mut_t1, mut_t2)
+mut_t1_only <- base::setdiff(mut_t1, mut_both)
+mut_t2_only <- base::setdiff(mut_t2, mut_both)
+
+subset_obj$TCF12_clone[mut_t1_only] <- "TCF12_1"
+subset_obj$TCF12_clone[mut_t2_only] <- "TCF12_2"
+
+message("Clone counts (exclusive; both-mutated removed):")
+print(table(subset_obj$TCF12_clone, useNA = "ifany"))
+message("Removed (mutated for BOTH): ", length(mut_both))
+
+# Keep only assigned clones for DE
+subset_obj_de <- subset(subset_obj, subset = !is.na(TCF12_clone))
+subset_obj_de$TCF12_clone <- factor(subset_obj_de$TCF12_clone, levels = c("TCF12_1", "TCF12_2"))
+Seurat::Idents(subset_obj_de) <- "TCF12_clone"
+
+if (length(unique(Seurat::Idents(subset_obj_de))) < 2) {
+  stop("Not enough cells in both clone groups for DE. Check target names and genotyped cells.")
+}
+
+## -------------------------
+## 3) Differential expression
+## -------------------------
+markers <- Seurat::FindMarkers(
+  subset_obj_de,
+  ident.1  = "TCF12_1",
+  ident.2  = "TCF12_2",
+  test.use = "wilcox"
+)
+
+markers$p_val_adj[markers$p_val_adj == 0] <- 1e-300
+markers$log10_pval <- -log10(markers$p_val_adj)
+
+markers$Significance <- ifelse(
+  markers$p_val_adj < p_cutoff & abs(markers$avg_log2FC) > fc_cutoff,
+  "Significant",
+  "Not Significant"
+)
+
+## -------------------------
+## 4) Volcano plot — compact theme for 5 cm (w) x 6 cm (h)
+## -------------------------
+log_p_cutoff <- -log10(p_cutoff)
+colors <- c("Significant" = "firebrick", "Not Significant" = "lightgrey")
+
+ymax <- max(markers$log10_pval, na.rm = TRUE) * 1.1
+y_breaks <- unique(c(0, log_p_cutoff, seq(5, ceiling(ymax/5) * 5, by = 5)))
+y_breaks <- y_breaks[y_breaks <= ymax]
+
+lab_df <- markers[rownames(markers) %in% genes_to_label, , drop = FALSE]
+lab_df$gene <- rownames(lab_df)
+
+p <- ggplot2::ggplot(markers, ggplot2::aes(x = avg_log2FC, y = log10_pval, color = Significance)) +
+  ggplot2::geom_point(size = 0.25, alpha = 0.8, stroke = 0) +
+  ggplot2::scale_color_manual(values = colors) +
+  ggplot2::geom_hline(yintercept = log_p_cutoff, linetype = "dashed", color = "black", linewidth = 0.2, alpha = 0.3) +
+  ggplot2::geom_vline(xintercept = c(-fc_cutoff, fc_cutoff), linetype = "dashed", color = "black", linewidth = 0.2, alpha = 0.3) +
+  ggplot2::scale_x_continuous(
+    breaks = c(-5, 0, 5),
+    labels = c("-5", "0", "+5")
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, ymax),
+    breaks = y_breaks,
+    labels = scales::label_number(accuracy = 1),
+    expand = c(0, 0)
+  ) +
+  ggrepel::geom_text_repel(
+    data = lab_df,
+    ggplot2::aes(label = gene),
+    size = 1.4,                 # ~5pt — practical floor for legible print text
+    color = "black",
+    segment.size = 0.1,
+    segment.alpha = 0.5,
+    box.padding = 0.05,
+    point.padding = 0.05,
+    min.segment.length = 0,
+    max.overlaps = 40,
+    force = 2
+  ) +
+  ggplot2::labs(
+    x = expression(log[2]~FC),
+    y = expression(-log[10]~adj.~italic(p))
+  ) +
+  ggplot2::theme_minimal(base_size = 5) +
+  ggplot2::theme(
+    legend.position = "none",                                    # see note below code
+    axis.title  = ggplot2::element_text(size = 5),
+    axis.text   = ggplot2::element_text(size = 4),
+    panel.grid  = ggplot2::element_blank(),
+    panel.border = ggplot2::element_blank(),
+    axis.line   = ggplot2::element_line(color = "black", linewidth = 0.2),
+    axis.ticks  = ggplot2::element_line(color = "black", linewidth = 0.2),
+    axis.ticks.length = unit(0.5, "mm"),
+    plot.margin = ggplot2::margin(1, 1, 1, 1, unit = "mm")
+  )
+
+save_png_pdf(out_prefix, p, width = 5, height = 6)
+utils::write.csv(markers, paste0(out_prefix, "_markers.csv"))
+
+message("Saved volcano + CSV:")
+message("  ", out_prefix, ".png")
+message("  ", out_prefix, ".pdf")
+message("  ", out_prefix, "_markers.csv")
+```
+
+```{r TCF12 subclone marker heatmap with mtDNA variants}
+## ============================================================
+## Heatmap: Differential marker expression in TCF12 subclones
+## ============================================================
+
+stopifnot(exists("obj_1010"), exists("AML1010_rhPCR"))
+stopifnot("TCF12" %in% names(AML1010_rhPCR), "TCF12_2" %in% names(AML1010_rhPCR))
+stopifnot(exists("af_merged"), exists("cov_merged"), exists("min_pos_depth"))
+
+seurat_obj <- obj_1010
+t1 <- AML1010_rhPCR$TCF12
+t2 <- AML1010_rhPCR$TCF12_2
+
+## -------------------------
+## SETTINGS
+## -------------------------
+prefix <- file.path(
+  FIG_DIR,
+  "heatmap_TCF12_vs_TCF12_2_mutated_only_diverging_singleLegend_plus3MT_9222_9820_9655_9525_15530"
+)
+
+genes_to_plot <- c(
+  "SELL", "HIST3H2A", "FAM171A1", "OVCH1-AS1", "POU4F1", "CDKN2A", "SELP", "APP",
+  "CAVIN1", "NEFH", "CYYR1", "SCRN1", "RNF217", "FXYD6", "HNRNPLL", "REEP3",
+  "ZNF718", "CPLX1"
+)
+
+relevant_compartments <- c("HSCs", "Lymphoid progenitors", "GMPs")
+CELLTYPE_COL <- ANNOT_COL
+ASSAY_TO_USE <- "RNA"
+SLOT_TO_USE  <- "data"
+CLIP_Z <- 3
+
+mito_variants <- c("9222C>T", "9820G>C", "9655G>C", "9525G>C", "15530T>C")
+mito_present_cutoff <- 1  # AF > 1% => mutated
+
+## -------------------------
+## Helper: collapse genotype calls per barcode
+## -------------------------
+collapse_status <- function(df, cells_keep) {
+  stopifnot(all(c("bc", "mutated") %in% colnames(df)))
+  df %>%
+    mutate(bc = as.character(bc), mutated = as.character(mutated)) %>%
+    filter(bc %in% cells_keep) %>%
+    group_by(bc) %>%
+    summarise(
+      status = ifelse(any(mutated == "mutated"), "mutated",
+                      ifelse(any(mutated == "wildtype"), "wildtype", "unknown")),
+      .groups = "drop"
+    )
+}
+
+## -------------------------
+## 1) Subset compartments
+## -------------------------
+if (!is.null(relevant_compartments)) {
+  stopifnot(CELLTYPE_COL %in% colnames(seurat_obj@meta.data))
+  cells_keep_comp <- rownames(seurat_obj@meta.data)[seurat_obj@meta.data[[CELLTYPE_COL]] %in% relevant_compartments]
+  seurat_obj <- subset(seurat_obj, cells = cells_keep_comp)
+}
+
+cells_in_seurat <- colnames(seurat_obj)
+
+## -------------------------
+## 2) Build per-cell mutation status for both loci
+## -------------------------
+t1_map <- collapse_status(t1, cells_in_seurat)
+t2_map <- collapse_status(t2, cells_in_seurat)
+
+seurat_obj$TCF12_1_status <- "unknown"
+seurat_obj$TCF12_2_status <- "unknown"
+seurat_obj$TCF12_1_status[t1_map$bc] <- t1_map$status
+seurat_obj$TCF12_2_status[t2_map$bc] <- t2_map$status
+
+## -------------------------
+## 3) Mutually exclusive mutated cells, drop double mutants
+## -------------------------
+cells_mut_t1   <- rownames(seurat_obj@meta.data)[seurat_obj$TCF12_1_status == "mutated"]
+cells_mut_t2   <- rownames(seurat_obj@meta.data)[seurat_obj$TCF12_2_status == "mutated"]
+cells_mut_both <- intersect(cells_mut_t1, cells_mut_t2)
+
+cells_tcf12_only   <- setdiff(cells_mut_t1, cells_mut_both)
+cells_tcf12_2_only <- setdiff(cells_mut_t2, cells_mut_both)
+
+cat("TCF12 mutated cells:     ", length(cells_mut_t1), "\n")
+cat("TCF12_2 mutated cells:   ", length(cells_mut_t2), "\n")
+cat("Mutated in BOTH (drop):  ", length(cells_mut_both), "\n")
+cat("TCF12-only (keep):       ", length(cells_tcf12_only), "\n")
+cat("TCF12_2-only (keep):     ", length(cells_tcf12_2_only), "\n")
+
+cells_keep <- unique(c(cells_tcf12_only, cells_tcf12_2_only))
+stopifnot(length(cells_keep) > 0)
+
+seurat_sub <- subset(seurat_obj, cells = cells_keep)
+md <- seurat_sub@meta.data
+
+## -------------------------
+## 4) Add mtDNA variant statuses to metadata (coverage-aware)
+## -------------------------
+missing_vars <- setdiff(mito_variants, rownames(af_merged))
+if (length(missing_vars) > 0) {
+  stop("Missing mtDNA variants from af_merged: ", paste(missing_vars, collapse = ", "))
+}
+
+cells_all     <- colnames(seurat_sub)
+cells_in_mito <- intersect(cells_all, colnames(af_merged))
+
+for (v in mito_variants) {
+  col_nm <- paste0("MT_", gsub("[^A-Za-z0-9]+", "_", v), "_status")
+  md[[col_nm]] <- "unknown"
+
+  af_vec  <- rep(NA_real_, length(cells_all)); names(af_vec)  <- cells_all
+  cov_vec <- rep(NA_real_, length(cells_all)); names(cov_vec) <- cells_all
+
+  af_vec[cells_in_mito]  <- as.numeric(af_merged[v, cells_in_mito])
+  cov_vec[cells_in_mito] <- as.numeric(cov_merged[v, cells_in_mito])
+
+  genotyped <- !is.na(cov_vec) & cov_vec >= min_pos_depth
+
+  md[[col_nm]][genotyped & af_vec >  mito_present_cutoff] <- "mutated"
+  md[[col_nm]][genotyped & af_vec <= mito_present_cutoff] <- "wildtype"
+
+  cat("\nmtDNA", v, "status (AF>", mito_present_cutoff, "%, coverage-aware):\n")
+  print(table(md[[col_nm]], useNA = "ifany"))
+}
+
+## -------------------------
+## 5) Column ordering: TCF12 blocks (A/B) then TCF12_2 blocks (C/D),
+##    random within each block
+## -------------------------
+blockA <- rownames(md)[md$TCF12_1_status == "mutated" & md$TCF12_2_status == "wildtype"]
+blockB <- rownames(md)[md$TCF12_1_status == "mutated" & md$TCF12_2_status == "unknown"]
+blockC <- rownames(md)[md$TCF12_2_status == "mutated" & md$TCF12_1_status == "wildtype"]
+blockD <- rownames(md)[md$TCF12_2_status == "mutated" & md$TCF12_1_status == "unknown"]
+
+set.seed(42)
+blockA <- sample(blockA)
+blockB <- sample(blockB)
+blockC <- sample(blockC)
+blockD <- sample(blockD)
+
+ordered_cells <- unique(c(blockA, blockB, blockC, blockD))
+stopifnot(setequal(ordered_cells, colnames(seurat_sub)))
+
+column_split <- factor(
+  ifelse(ordered_cells %in% cells_tcf12_only, "TCF12_mutated", "TCF12_2_mutated"),
+  levels = c("TCF12_mutated", "TCF12_2_mutated")
+)
+
+## -------------------------
+## 6) Expression matrix + Z-scaling per gene
+## -------------------------
+DefaultAssay(seurat_sub) <- ASSAY_TO_USE
+
+genes_present <- intersect(genes_to_plot, rownames(seurat_sub[[ASSAY_TO_USE]]))
+if (length(genes_present) == 0) stop("None of genes_to_plot found in RNA assay.")
+
+mat  <- GetAssayData(seurat_sub, assay = ASSAY_TO_USE, layer = SLOT_TO_USE)
+expr <- as.matrix(mat[genes_present, ordered_cells, drop = FALSE])
+
+z <- t(scale(t(expr)))
+z[is.na(z) | is.infinite(z)] <- 0
+z[z >  CLIP_Z] <-  CLIP_Z
+z[z < -CLIP_Z] <- -CLIP_Z
+
+## -------------------------
+## 7) Colors
+## -------------------------
+mut_cols <- c("mutated" = "firebrick", "wildtype" = "white", "unknown" = "grey85")
+
+expr_col_fun <- circlize::colorRamp2(
+  c(-CLIP_Z, 0, CLIP_Z),
+  c("#0072B2", "#F7F7F7", "#E69F00")
+)
+
+## -------------------------
+## 8) Compact top annotation (abbreviated labels, no inline legend)
+## -------------------------
+top_ha <- HeatmapAnnotation(
+  `TCF12`   = md[ordered_cells, "TCF12_1_status"],
+  `TCF12_2` = md[ordered_cells, "TCF12_2_status"],
+  `9222`    = md[ordered_cells, "MT_9222C_T_status"],
+  `9820`    = md[ordered_cells, "MT_9820G_C_status"],
+  `9655`    = md[ordered_cells, "MT_9655G_C_status"],
+  `9525`    = md[ordered_cells, "MT_9525G_C_status"],
+  `15530`   = md[ordered_cells, "MT_15530T_C_status"],
+  col = list(
+    `TCF12`   = mut_cols, `TCF12_2` = mut_cols,
+    `9222`    = mut_cols, `9820`    = mut_cols, `9655`  = mut_cols,
+    `9525`    = mut_cols, `15530`   = mut_cols
+  ),
+  gp = gpar(col = NA),
+  show_legend = FALSE,
+  annotation_name_gp   = gpar(fontsize = 5, fontface = "italic"),
+  annotation_name_side = "left",
+  border = TRUE,
+  simple_anno_size = unit(2, "mm"),
+  gap = unit(0.3, "mm")
+)
+
+## -------------------------
+## 9) Compact heatmap (no title, tiny row name font)
+## -------------------------
+heatmap_plot <- Heatmap(
+  z,
+  name = "Expression",
+  col = expr_col_fun,
+  top_annotation = top_ha,
+  column_split = column_split,
+  show_column_names = FALSE,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  row_names_gp   = gpar(fontsize = 5, fontface = "italic"),
+  row_names_side = "left",
+  column_title = NULL,
+  border = TRUE,
+  use_raster = TRUE,
+  raster_quality = 5
+)
+
+## -------------------------
+## 10) Save heatmap body only — 12 cm wide x 5 cm high, no legends
+## -------------------------
+heatmap_width_in  <- 12 / 2.54
+heatmap_height_in <- 5  / 2.54
+
+pdf(paste0(prefix, ".pdf"), width = heatmap_width_in, height = heatmap_height_in, useDingbats = FALSE)
+draw(heatmap_plot, show_heatmap_legend = FALSE, show_annotation_legend = FALSE,
+     padding = unit(c(1, 16, 1, 1), "mm"))
+dev.off()
+
+png(paste0(prefix, ".png"),
+    width = heatmap_width_in * 300, height = heatmap_height_in * 300,
+    res = 300, type = "cairo-png")
+draw(heatmap_plot, show_heatmap_legend = FALSE, show_annotation_legend = FALSE,
+     padding = unit(c(1, 16, 1, 1), "mm"))
+dev.off()
+
+## -------------------------
+## 11) Save legends separately (not counted in the 12x5 cm size)
+## -------------------------
+heatmap_legend <- Legend(
+  col_fun = expr_col_fun,
+  title = "Expression (Z)",
+  at = c(-CLIP_Z, 0, CLIP_Z),
+  direction = "horizontal"
+)
+
+annotation_legend <- Legend(
+  title = "Mutation status",
+  at = c("mutated", "wildtype", "unknown"),
+  labels = c("Mutated", "Wildtype", "Unknown"),
+  legend_gp = gpar(fill = mut_cols[c("mutated", "wildtype", "unknown")])
+)
+
+legend_list <- packLegend(heatmap_legend, annotation_legend, direction = "horizontal")
+
+pdf(paste0(prefix, "_legend.pdf"), width = 6, height = 1.5)
+draw(legend_list)
+dev.off()
+
+message("Saved: ", paste0(prefix, ".pdf"))
+message("Saved: ", paste0(prefix, ".png"))
+message("Saved: ", paste0(prefix, "_legend.pdf"))
+```
