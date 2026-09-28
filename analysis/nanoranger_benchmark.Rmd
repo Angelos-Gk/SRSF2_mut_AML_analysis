@@ -1,5 +1,5 @@
 ---
-title: "Figure 1 - nanoranger genotyping benchmark (AML1010, AML1026)"
+title: "nanoranger genotyping benchmark (AML1010, AML1026)"
 output: html_document
 ---
 
