@@ -9,12 +9,12 @@ This repository contains all code to reproduce the analysis from Galanopoulos *e
 ## Main Figures
 
 Figure 1 ( [B](analysis/nanoranger_benchmark.Rmd) | [C](analysis/nanoranger_benchmark.Rmd) | [D](analysis/nanoranger_benchmark.Rmd)) \
-Figure 2 ( [B](analysis/AML1010_1026_analysis.Rmd) | [C](analysis/AML1010_1026_analysis.Rmd) | [D](analysis/AML1010_1026_analysis.Rmd) | [E up](analysis/AML1010_1026_analysis.Rmd) | [E down](analysis/mito_analysis.Rmd) | [F](analysis/AML1010_1026_analysis.Rmd))\
+Figure 2 ( [B](analysis/AML1010_1026_analysis.Rmd) | [C](analysis/AML1010_1026_analysis.Rmd) | [D](analysis/AML1010_1026_analysis.Rmd) | [E up](analysis/AML1010_1026_analysis.Rmd) | [E down](analysis/mito_analysis.Rmd) | [F](analysis/AML1010_1026_analysis.Rmd))
 
 
 ## Supplementary Figures
 
-Supplementary Figure 1 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd)  | [D](analysis/mtDNA_Mutation_Statistics.Rmd))\
+Supplementary Figure 1 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd)  | [D](analysis/mtDNA_Mutation_Statistics.Rmd))
 
 
 ## Data availability
