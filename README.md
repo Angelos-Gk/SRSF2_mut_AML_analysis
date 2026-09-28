@@ -2,9 +2,9 @@
 This repository contains all code to reproduce the analysis from Galanopoulos *et al.* (2026)\
 
 ## Table of Contents
-processing: contains the scripts to preprocess the data and generate the necessary objects
-analysis: contains the scripts that utilize that further analyze the data and generate the plots
-conda_envs: contains yaml files to recreate the conda environments used during the analysis
+processing: contains the scripts to preprocess the data and generate the necessary objects \
+analysis: contains the scripts that utilize that further analyze the data and generate the plots \
+conda_envs: contains yaml files to recreate the conda environments used during the analysis \
 
 ## Main Figures
 
