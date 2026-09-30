@@ -1,0 +1,632 @@
+---
+title: "Figure 4 - clonal architecture of the SRSF2-mutant cohort"
+output: html_document
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(scales)
+  library(igraph)
+  library(GenomicRanges)
+  library(VariantAnnotation)
+  library(qs2)
+})
+
+## =========================================================
+## Paths
+## =========================================================
+PROJECT_DIR <- "/path/to/project"
+OBJ_DIR     <- file.path(PROJECT_DIR, "objects")
+FACETS_DIR  <- file.path(PROJECT_DIR, "cnv_facets/output")   # FACETS output, one folder per tumor/normal pair
+PYCLONE_DIR <- file.path(PROJECT_DIR, "pyclone")             # PyClone-VI input/output + clone tables
+FIG_DIR     <- file.path(PROJECT_DIR, "plots/figure4")
+dir.create(PYCLONE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(FIG_DIR,     recursive = TRUE, showWarnings = FALSE)
+
+FACETS_SUMMARY <- file.path(FACETS_DIR, "facets_purity_ploidy_summary.tsv")
+
+## =========================================================
+## Inputs
+##   - wes_info:   preprocessing/wes/04_wes_variant_filtering.Rmd
+##   - srsf2_nano: nanoranger calls of the SRSF2 cohort
+##   - FACETS purity/ploidy + segment VCFs (FACETS_DIR)
+## =========================================================
+wes_info   <- qs2::qs_read(file.path(OBJ_DIR, "wes_info.qs2"))
+srsf2_nano <- qs2::qs_read(file.path(OBJ_DIR, "srsf2_nano_combined_filtered.qs2"))
+
+## =========================================================
+## Shared colors
+## =========================================================
+RED   <- "#B2182B"; DKRED <- "#7b1420"; BLUE  <- "#2166AC"
+GREY  <- "#BFBFBF"; GREYL <- "grey88";  DGREY <- "#4d4d4d"
+```
+
+```{r tumour purity and ploidy (FACETS, VAF fallback)}
+# ── driver gene list (as used in the earlier cross-check) ──
+driver_genes <- c("SRSF2","ASXL1","RUNX1","TET2","IDH1","IDH2","NRAS","FLT3","TP53","DNMT3A")
+
+# ── 1. FACETS purity/ploidy (authoritative, from disk) ──
+facets_pp <- readr::read_tsv(FACETS_SUMMARY, show_col_types = FALSE) %>%
+  dplyr::mutate(patient = sub("_tumor.*", "", patient)) %>%
+  dplyr::rename(facets_purity = purity, facets_ploidy = ploidy)
+
+# ── 2. max-driver VAF per patient (fallback estimate, computed for ALL) ──
+vaf_purity_all <- wes_info %>%
+  dplyr::filter(gene %in% driver_genes) %>%
+  dplyr::mutate(patient = as.character(SAMPLE_ID)) %>%
+  dplyr::group_by(patient) %>%
+  dplyr::summarise(
+    max_vaf_gene = gene[which.max(VAF)],
+    max_vaf      = max(VAF),
+    vaf_purity   = pmin(2 * max_vaf, 1),   # 2 x highest-VAF driver, capped at 1
+    .groups = "drop"
+  )
+
+# ── 3. combine: FACETS where non-NA, else VAF fallback ──
+final_purity_ploidy <- facets_pp %>%
+  dplyr::full_join(vaf_purity_all, by = "patient") %>%
+  dplyr::mutate(
+    final_purity = dplyr::case_when(
+      !is.na(facets_purity) ~ facets_purity,   # FACETS wins wherever it converged
+      !is.na(vaf_purity)    ~ vaf_purity,       # else 2 x max-driver VAF
+      TRUE                  ~ NA_real_
+    ),
+    final_ploidy = dplyr::case_when(
+      !is.na(facets_ploidy) ~ facets_ploidy,
+      TRUE                  ~ 2.0               # diploid assumption for VAF-fallback patients
+    ),
+    purity_source = dplyr::case_when(
+      !is.na(facets_purity) ~ "FACETS",
+      !is.na(vaf_purity)    ~ "VAF_fallback",
+      TRUE                  ~ "MISSING"
+    )
+  ) %>%
+  dplyr::select(patient, final_purity, final_ploidy, purity_source,
+                facets_purity, facets_ploidy, vaf_purity, max_vaf_gene) %>%
+  dplyr::arrange(readr::parse_number(patient))
+
+# ── 3b. override FACETS for P11 (implausible near-haploid fit: purity 0.23, ploidy 1.28) ──
+#    Its FACETS solution corrupts BOTH purity and per-locus CN (49 spurious TCN=1 loci),
+#    forcing CCF > 1 for clonal SRSF2 (VAF ~0.45). Revert to VAF fallback + diploid.
+final_purity_ploidy <- final_purity_ploidy %>%
+  dplyr::mutate(
+    final_purity  = dplyr::if_else(patient == "P11", vaf_purity, final_purity),
+    final_ploidy  = dplyr::if_else(patient == "P11", 2.0,        final_ploidy),
+    purity_source = dplyr::if_else(patient == "P11", "VAF_fallback_override", purity_source)
+  )
+# quick check: expect 9 FACETS, 5 VAF_fallback, 0 MISSING
+#final_purity_ploidy %>% dplyr::count(purity_source)
+```
+
+```{r PyClone-VI input}
+# ── 0. upstream objects ──
+patients_keep <- final_purity_ploidy$patient
+MIN_VAF       <- 0.05
+
+# ── 1. per-patient purity (FACETS where available, else max-driver VAF fallback) ──
+purity_lookup <- final_purity_ploidy %>%
+  dplyr::select(patient, final_purity, purity_source)
+
+facets_patients <- purity_lookup %>%
+  dplyr::filter(purity_source == "FACETS") %>%      # "VAF_fallback_override" excluded -> P11 out
+  dplyr::pull(patient)
+
+# VERIFY the override took effect: P11 must NOT be here; expect 8 FACETS patients
+message("FACETS patients (CN will be read): ", paste(sort(facets_patients), collapse = ", "))
+stopifnot(!("P11" %in% facets_patients))
+
+# ── 2. load FACETS segment copy number (TCN_EM / LCN_EM) for FACETS patients ──
+load_facets_seg <- function(pt) {
+  pair_tag <- paste0(pt, "_tumor__vs__", pt, "_germ")
+  vcf_f <- Sys.glob(file.path(FACETS_DIR, pair_tag, "*.vcf.gz"))
+  if (length(vcf_f) == 0) { message("  No FACETS VCF for ", pt); return(NULL) }
+  v    <- VariantAnnotation::readVcf(vcf_f[1], "hg38")
+  gr   <- SummarizedExperiment::rowRanges(v)
+  info <- VariantAnnotation::info(v)
+  GenomicRanges::GRanges(
+    seqnames = GenomeInfoDb::seqnames(gr),
+    ranges   = IRanges::IRanges(start = BiocGenerics::start(gr), end = info$END),
+    tcn      = as.integer(info$TCN_EM),
+    lcn      = info$LCN_EM,
+    patient  = pt
+  )
+}
+facets_seg <- if (length(facets_patients) > 0) {
+  do.call(c, lapply(facets_patients, load_facets_seg))
+} else NULL
+
+# ── 3. base mutation table (VAF filter) ──
+muts <- wes_info %>%
+  dplyr::filter(SAMPLE_ID %in% patients_keep, VAF >= MIN_VAF) %>%
+  dplyr::mutate(
+    patient  = as.character(SAMPLE_ID),
+    CHROM    = as.character(CHROM),
+    POS      = as.integer(POS),
+    major_cn = 1L,
+    minor_cn = 1L
+  )
+
+# ── 4. assign per-locus copy number by overlapping each mutation with its segment ──
+if (!is.null(facets_seg)) {
+  mut_gr <- GenomicRanges::GRanges(
+    seqnames = muts$CHROM,
+    ranges   = IRanges::IRanges(start = muts$POS, width = 1)
+  )
+  for (pt in facets_patients) {
+    seg_pt <- facets_seg[facets_seg$patient == pt]
+    if (length(seg_pt) == 0) next
+    rows <- which(muts$patient == pt)
+    hits <- GenomicRanges::findOverlaps(mut_gr[rows], seg_pt)
+    if (length(hits) == 0) next
+    qi  <- rows[S4Vectors::queryHits(hits)]
+    si  <- S4Vectors::subjectHits(hits)
+    tcn <- seg_pt$tcn[si]
+    lcn <- seg_pt$lcn[si]
+    lcn[is.na(lcn)] <- 0L
+    ok  <- !is.na(tcn)
+    muts$minor_cn[qi[ok]] <- as.integer(lcn[ok])
+    muts$major_cn[qi[ok]] <- as.integer(pmax(tcn[ok] - lcn[ok], 1L))
+  }
+}
+
+# ── 5. build PyClone-VI input ──
+pyclone_input <- muts %>%
+  dplyr::left_join(purity_lookup, by = "patient") %>%
+  dplyr::transmute(
+    mutation_id    = paste0(gene, "_", protein_change, "_", CHROM, ":", POS),
+    sample_id      = patient,
+    ref_counts     = as.integer(AD_REF),
+    alt_counts     = as.integer(AD_ALT),
+    normal_cn      = 2L,
+    major_cn       = as.integer(major_cn),
+    minor_cn       = as.integer(minor_cn),
+    tumour_content = round(pmin(pmax(final_purity, 1e-3), 1.0), 4)
+  )
+
+# ── 6. sanity guards ──
+stopifnot(
+  all(!is.na(pyclone_input$tumour_content)),
+  all(pyclone_input$tumour_content > 0 & pyclone_input$tumour_content <= 1),
+  all(pyclone_input$major_cn >= 1),
+  all(pyclone_input$minor_cn >= 0),
+  all(pyclone_input$major_cn >= pyclone_input$minor_cn),
+  all(pyclone_input$alt_counts >= 0 & pyclone_input$ref_counts >= 0)
+)
+
+# ── 7. write combined file ──
+readr::write_tsv(pyclone_input, file.path(PYCLONE_DIR, "pyclone_vi_input.tsv"))
+
+message("PyClone-VI input written to: ", PYCLONE_DIR)
+message("Samples: ",   paste(sort(unique(pyclone_input$sample_id)), collapse = ", "))
+message("Mutations: ", nrow(pyclone_input))
+message("Loci with non-diploid CN: ",
+        sum(pyclone_input$major_cn != 1 | pyclone_input$minor_cn != 1))
+
+# ── 8. confirm P11 is now diploid + high purity ──
+pyclone_input %>%
+  dplyr::filter(sample_id == "P11") %>%
+  dplyr::summarise(
+    n_mut          = dplyr::n(),
+    n_nondiploid   = sum(major_cn != 1 | minor_cn != 1),
+    tumour_content = unique(tumour_content)
+  ) %>%
+  as.data.frame() %>%
+  print()
+```
+
+```{bash run PyClone-VI}
+# run from the PyClone-VI folder (PYCLONE_DIR in the setup chunk), in the pyclone-vi conda env
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate pyclone-vi
+cd /path/to/project/pyclone
+
+for PATIENT in P1 P2 P3 P4 P6 P7 P10 P11 P12 P13 P14 P15 P16 P17; do
+
+  mkdir -p ${PATIENT}
+
+  # subset combined input to this patient (header + rows where col2 == PATIENT)
+  head -1 pyclone_vi_input.tsv > ${PATIENT}/input.tsv
+  grep -P "^[^\t]+\t${PATIENT}\t" pyclone_vi_input.tsv >> ${PATIENT}/input.tsv
+
+  # guard: skip if no mutations for this patient
+  n=$(($(wc -l < ${PATIENT}/input.tsv) - 1))
+  if [ "$n" -lt 1 ]; then echo "WARN: ${PATIENT} has $n mutations — skipping"; continue; fi
+  echo "Fitting ${PATIENT} ($n mutations)"
+
+  pyclone-vi fit \
+    --in-file  ${PATIENT}/input.tsv \
+    --out-file ${PATIENT}/results.tsv \
+    --num-clusters 10 \
+    --num-restarts 20 \
+    --density beta-binomial \
+    --seed 42 \
+    2>&1 | tee ${PATIENT}/fit.log
+
+  pyclone-vi write-results-file \
+    --in-file  ${PATIENT}/results.tsv \
+    --out-file ${PATIENT}/clusters.tsv
+
+  echo "Done: ${PATIENT}"
+done
+```
+
+```{r load PyClone-VI output}
+# ── config ──────────────────────────────────────────────────────────────
+PATIENTS    <- c("P1","P2","P3","P4","P6","P7","P10","P11","P12","P13","P14","P15","P16","P17")
+CLONAL_CCF  <- 0.85          # CCF >= this => "clonal"
+
+# AML driver panel — edit to match your paper's gene set
+DRIVERS <- c("SRSF2","ASXL1","RUNX1","IDH1","IDH2","TET2","DNMT3A","STAG2",
+             "JAK2","FLT3","NPM1","NRAS","KRAS","CEBPA","TP53","SETBP1",
+             "EZH2","BCOR","U2AF1","SF3B1","PHF6","WT1","PTPN11","CBL",
+             "KIT","GATA2","ETV6","RAD21","SETD2","ATM","KMT2A","NF1")
+
+theme_paper <- theme_classic(base_size = 11) +
+  theme(axis.text = element_text(colour = "black"),
+        plot.title = element_text(face = "plain", size = 11),
+        legend.position = "right")
+
+# ── load every clusters.tsv ─────────────────────────────────────────────
+clust <- purrr::map_dfr(PATIENTS, function(pt) {
+  f <- file.path(PYCLONE_DIR, pt, "clusters.tsv")
+  if (!file.exists(f)) { warning("missing: ", f); return(NULL) }
+  readr::read_tsv(f, show_col_types = FALSE) %>%
+    dplyr::mutate(patient = pt)
+})
+
+# gene = token before first "_"; CCF = cellular_prevalence (already purity-adjusted)
+clust <- clust %>%
+  dplyr::mutate(gene = sub("_.*$", "", mutation_id),
+                ccf  = cellular_prevalence)
+
+# per-gene, per-patient CCF (max across multiple mutations in the same gene)
+gene_ccf <- clust %>%
+  dplyr::filter(gene %in% DRIVERS) %>%
+  dplyr::group_by(patient, gene) %>%
+  dplyr::summarise(ccf = max(ccf),
+                   cluster_id = cluster_id[which.max(ccf)],
+                   .groups = "drop") %>%
+  dplyr::mutate(clonal = ccf >= CLONAL_CCF)
+
+# SRSF2 CCF per patient (anchor)
+srsf2_ccf <- gene_ccf %>% dplyr::filter(gene == "SRSF2") %>%
+  dplyr::select(patient, srsf2_ccf = ccf)
+
+message("Loaded ", length(unique(clust$patient)), " patients, ",
+        nrow(gene_ccf), " driver-gene CCF rows")
+```
+
+```{r single-cell genotype table}
+# per-cell informative genotype: nanoranger calls with >= 1 read (alt + ref > 0),
+# mutated/wildtype only, healthy donors removed; one row per patient/bc/gene
+nano <- srsf2_nano %>%
+  dplyr::mutate(patient = as.character(sample_name),
+                is_hd   = grepl("^HD", patient)) %>%
+  dplyr::filter(alt + ref > 0)
+
+geno <- nano %>%
+  dplyr::filter(!is_hd, mutated %in% c("mutated","wildtype")) %>%
+  dplyr::distinct(patient, bc, gene, mutated)
+```
+
+```{r mutations preceding SRSF2 (single-cell)}
+# ── thresholds (tune these) ──────────────────────────────────────────────
+MIN_BOTH        <- 50  # cells genotyped for BOTH loci — the "not very few" guard
+MIN_TARGET_ONLY <- 10    # min cells in the "target+ / SRSF2 WT" class (signal can't rest on a handful)
+TOP_N           <- 12    # how many top preceding-pairs to show
+
+srsf2_call <- geno %>% dplyr::filter(gene == "SRSF2") %>%
+  dplyr::select(patient, bc, srsf2 = mutated)
+
+# every OTHER locus, joined to the SRSF2 call in the SAME cell
+pair_cells <- geno %>%
+  dplyr::filter(gene != "SRSF2") %>%
+  dplyr::rename(target = gene, tcall = mutated) %>%
+  dplyr::inner_join(srsf2_call, by = c("patient","bc")) %>%   # cells with BOTH calls
+  dplyr::mutate(class = dplyr::case_when(
+    srsf2=="mutated"  & tcall=="mutated"  ~ "SRSF2+ / target+",
+    srsf2=="mutated"  & tcall=="wildtype" ~ "SRSF2+ / target WT",
+    srsf2=="wildtype" & tcall=="mutated"  ~ "target+ / SRSF2 WT",
+    TRUE                                   ~ "WT / WT"))
+
+# counts per (patient, target), wide
+pair_counts <- pair_cells %>%
+  dplyr::count(patient, target, class, name = "n") %>%
+  tidyr::pivot_wider(names_from = class, values_from = n, values_fill = 0)
+for (cc in c("SRSF2+ / target+","SRSF2+ / target WT","target+ / SRSF2 WT","WT / WT"))
+  if (!cc %in% names(pair_counts)) pair_counts[[cc]] <- 0L
+
+# ── selection: target precedes SRSF2  (target_only > srsf2_only) ─────────
+pair_stats <- pair_counts %>%
+  dplyr::mutate(
+    n_both      = `SRSF2+ / target+` + `SRSF2+ / target WT` + `target+ / SRSF2 WT` + `WT / WT`,
+    srsf2_only  = `SRSF2+ / target WT`,
+    target_only = `target+ / SRSF2 WT`,
+    excess      = target_only - srsf2_only,                     # >0 => target ancestral
+    # one-sided binomial: among discordant cells, is target_only the majority?
+    p_precede   = mapply(function(a,b)
+                    if ((a+b)>0) binom.test(a, a+b, 0.5, "greater")$p.value else NA_real_,
+                    target_only, srsf2_only)) %>%
+  dplyr::filter(n_both >= MIN_BOTH,
+                target_only >= MIN_TARGET_ONLY,
+                target_only >  srsf2_only) %>%
+  dplyr::arrange(dplyr::desc(excess))
+
+top_pairs <- head(pair_stats, TOP_N)
+print(as.data.frame(top_pairs %>% dplyr::select(
+  patient, target, n_both, srsf2_only, `SRSF2+ / target+`, target_only, excess, p_precede)))
+
+# ── reshape + plot (vertical stacked bars) ───────────────────────────────
+lab_order <- top_pairs %>%
+  dplyr::mutate(lab = paste0(patient, ": ", target)) %>%
+  dplyr::arrange(dplyr::desc(excess)) %>% dplyr::pull(lab)
+
+plot_f <- top_pairs %>%
+  dplyr::mutate(lab = paste0(patient, ": ", target)) %>%
+  dplyr::select(lab, n_both, `WT / WT`, `SRSF2+ / target WT`,
+                `SRSF2+ / target+`, `target+ / SRSF2 WT`) %>%
+  tidyr::pivot_longer(c(`WT / WT`,`SRSF2+ / target WT`,`SRSF2+ / target+`,`target+ / SRSF2 WT`),
+                      names_to = "class", values_to = "n") %>%
+  dplyr::group_by(lab) %>% dplyr::mutate(frac = n/sum(n)) %>% dplyr::ungroup() %>%
+  dplyr::mutate(
+    lab   = factor(lab, levels = lab_order),
+    class = factor(class, levels = c("WT / WT","SRSF2+ / target WT",
+                                     "SRSF2+ / target+","target+ / SRSF2 WT")))
+
+# strongest "target precedes" at TOP → reverse for coord_flip (ggplot draws bottom-up)
+plot_f <- plot_f %>% dplyr::mutate(lab = factor(lab, levels = rev(lab_order)))
+
+p_F <- ggplot(plot_f, aes(x = lab, y = frac, fill = class)) +
+  geom_col(width = 0.78, colour = "white", linewidth = 0.3) +
+  geom_text(data = dplyr::distinct(plot_f, lab, n_both),
+            aes(x = lab, y = 1.02, label = paste0("n=", n_both)),
+            inherit.aes = FALSE, size = 2.6, colour = DGREY, hjust = 0) +
+  scale_fill_manual(values = c(
+      "WT / WT"             = GREYL,
+      "SRSF2+ / target WT"  = RED,     # SRSF2-ancestral class
+      "SRSF2+ / target+"    = DKRED,   # double mutant
+      "target+ / SRSF2 WT"  = BLUE),   # target-ancestral class (the signal)
+      name = NULL) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.12))) +
+  coord_flip() +
+  labs(x = NULL, y = "fraction of co-genotyped cells",
+       title = "Candidate lesions preceding SRSF2 (single-cell)",
+       subtitle = "blue (target+/SRSF2-WT) > red (SRSF2+/target-WT) \u2192 target acquired before SRSF2") +
+  theme_classic(base_size = 10) +
+  theme(axis.text.y   = element_text(colour = "black", size = 8),   # pair labels, horizontal
+        axis.text.x   = element_text(colour = "black"),
+        plot.subtitle = element_text(size = 8, colour = DGREY),
+        legend.position = "bottom", legend.text = element_text(size = 7.5))
+ggsave(file.path(FIG_DIR, "preceding_srsf2_singlecell.pdf"), p_F, width = 7.4, height = 8)
+```
+
+```{r single-cell pairwise relations and clones}
+# ── thresholds ───────────────────────────────────────────────────────────
+MIN_BOTH     <- 50     # cells co-genotyped for a pair (data-sufficiency floor)
+MIN_MUT_FRAC <- 0.02   # each gene mutant in >= this FRACTION of co-genotyped cells ...
+MIN_MUT_ABS  <- 5      #   ... and >= this many (backstop) to make a call
+MIN_ASYM     <- 0.6    # nested only if larger _only class is >= this frac of discordant cells
+ALPHA        <- 0.05   # BH q for BOTH tests (Fisher association + McNemar symmetry)
+MIN_INF      <- 20     # informative cells for a variant to appear
+
+# ── 1. informative calls; per-gene mutant fraction ───────────────────────
+# (geno: single-cell genotype chunk)
+gene_f <- geno %>%
+  dplyr::group_by(patient, gene) %>%
+  dplyr::summarise(n_inf = dplyr::n(), n_mut = sum(mutated == "mutated"),
+                   f = n_mut / n_inf, .groups = "drop") %>%
+  dplyr::filter(n_inf >= MIN_INF, n_mut > 0)
+
+# ── 2. pairwise co-occurrence 2x2 ────────────────────────────────────────
+pl <- geno %>%
+  dplyr::inner_join(geno, by = c("patient","bc"), suffix = c("_A","_B"),
+                    relationship = "many-to-many") %>%
+  dplyr::filter(gene_A < gene_B)
+pc <- pl %>%
+  dplyr::mutate(class = dplyr::case_when(
+    mutated_A=="mutated"  & mutated_B=="mutated"  ~ "both",
+    mutated_A=="mutated"  & mutated_B=="wildtype" ~ "A_only",
+    mutated_A=="wildtype" & mutated_B=="mutated"  ~ "B_only",
+    TRUE                                           ~ "neither")) %>%
+  dplyr::count(patient, gene_A, gene_B, class, name = "n") %>%
+  tidyr::pivot_wider(names_from = class, values_from = n, values_fill = 0)
+for (cc in c("both","A_only","B_only","neither"))
+  if (!cc %in% names(pc)) pc[[cc]] <- 0L
+
+# ── 3. co-clonal | nested | independent — by TESTS, no containment cut-offs ──
+#   (1) Fisher one-sided greater : do they co-occur MORE than chance?  -> in same lineage?
+#   (2) exact McNemar (= binom.test on discordant cells vs 0.5): are A_only, B_only different?
+#       symmetric  -> co-clonal ; asymmetric (+ big enough) -> nested
+cooc <- pc %>%
+  dplyr::mutate(
+    n_both = both + A_only + B_only + neither, nA = both + A_only, nB = both + B_only,
+    cB_in_A = both / pmax(nB, 1), cA_in_B = both / pmax(nA, 1),   # kept for the record only
+    p_assoc = purrr::pmap_dbl(list(both, A_only, B_only, neither), function(a,b,c,d)
+                if ((a+b) > 0 && (a+c) > 0)
+                  fisher.test(matrix(c(a,b,c,d), 2), alternative = "greater")$p.value else NA_real_),
+    p_sym   = purrr::pmap_dbl(list(A_only, B_only), function(b, c)
+                if (b + c > 0) binom.test(b, b + c, 0.5)$p.value else NA_real_),
+    asym    = pmax(A_only, B_only) / pmax(A_only + B_only, 1)) %>%     # 0.5=symmetric, 1=total subset
+  dplyr::filter(n_both >= MIN_BOTH) %>%
+  dplyr::mutate(
+    q_assoc  = p.adjust(p_assoc, "BH"),
+    q_sym    = p.adjust(p_sym,   "BH"),
+    min_mut  = pmax(MIN_MUT_ABS, ceiling(MIN_MUT_FRAC * n_both)),
+    testable = nA >= min_mut & nB >= min_mut,
+    rel = dplyr::case_when(
+      !testable                             ~ "insufficient mutant cells",
+      q_assoc >= ALPHA                      ~ "independent",   # not co-occurring above chance
+      q_sym < ALPHA & asym >= MIN_ASYM      ~ "nested",        # real AND big enough asymmetry
+      TRUE                                  ~ "co-clonal"),    # symmetric, or too small to matter
+    # for nested pairs: the gene with the LARGER _only class is ancestral (its clone is bigger)
+    ancestor   = dplyr::case_when(rel=="nested" & A_only >= B_only ~ gene_A,
+                                  rel=="nested"                    ~ gene_B, TRUE ~ NA_character_),
+    descendant = dplyr::case_when(rel=="nested" & A_only >= B_only ~ gene_B,
+                                  rel=="nested"                    ~ gene_A, TRUE ~ NA_character_))
+readr::write_tsv(cooc, file.path(PYCLONE_DIR, "nano_cooccurrence.tsv"))
+print(cooc %>% dplyr::count(rel))
+
+# ── 4. clones = connected components of co-clonal edges ──────────────────
+assign_clones <- function(pt) {
+  genes <- gene_f %>% dplyr::filter(patient == pt) %>% dplyr::pull(gene)
+  if (length(genes) < 2) return(tibble::tibble(patient = pt, gene = genes, clone = 1L))
+  co <- cooc %>% dplyr::filter(patient == pt, rel == "co-clonal",
+                               gene_A %in% genes, gene_B %in% genes)
+  g <- igraph::make_empty_graph(directed = FALSE) + igraph::vertices(genes)
+  if (nrow(co) > 0) g <- igraph::add_edges(g, as.vector(t(as.matrix(co[, c("gene_A","gene_B")]))))
+  tibble::tibble(patient = pt, gene = genes, clone = igraph::components(g)$membership)
+}
+clones <- purrr::map_dfr(sort(unique(gene_f$patient)), assign_clones) %>%
+  dplyr::left_join(gene_f, by = c("patient","gene"))
+
+# drop patients genotyped for SRSF2 only (need >=2 genes)
+multi_gene_pts <- gene_f %>%
+  dplyr::group_by(patient) %>%
+  dplyr::summarise(n_genes = dplyr::n_distinct(gene), .groups = "drop") %>%
+  dplyr::filter(n_genes >= 2) %>% dplyr::pull(patient)
+
+readr::write_tsv(clones, file.path(PYCLONE_DIR, "nano_clone_membership.tsv"))
+```
+
+```{r clonality WES and single-cell anchored on SRSF2}
+## ═══════════════════════════════════════════════════════════════════════
+##  Fig: two-panel clonality — BOTH panels anchored on SRSF2
+##  Y axis = clone value RELATIVE to the SRSF2 clone (SRSF2 = 1.0)
+##    top  : CCF / SRSF2 CCF (WES)      bottom : prevalence / SRSF2 prevalence (single-cell)
+##  Axis reaches above 1.0 (coord_cartesian, no clipping) so clones that
+##  PRECEDE SRSF2 (ratio > 1) stay visible.
+##  Requires: clones, multi_gene_pts (single-cell relations chunk); clust (PyClone-VI output)
+## ═══════════════════════════════════════════════════════════════════════
+cell_labs  <- c("<200","200\u2013500","500\u20131000","1000\u20132000","\u22652000")
+sc_sizes   <- c(1.6, 2.6, 3.6, 4.6, 5.6) |> setNames(cell_labs)
+wes_breaks <- c(5, 10, 25, 50)
+WES_MAXSZ  <- 5
+
+# ── genes assayed in the single-cell panel (base symbol; strip _indel etc.) ──
+sc_genes <- unique(sub("_.*$", "", clones$gene))
+
+# ── WES clone table; label ONLY genes also in the single-cell panel ──
+wes_tab <- clust %>%
+  dplyr::mutate(gene_base = sub("_.*$", "", gene)) %>%
+  dplyr::group_by(patient, cluster_id) %>%
+  dplyr::summarise(f_clone   = dplyr::first(cellular_prevalence),
+                   size_val  = dplyr::n(),
+                   genes     = paste(sort(unique(gene_base[gene_base %in% sc_genes])),
+                                     collapse = "\n"),
+                   has_srsf2 = any(gene_base == "SRSF2"), .groups = "drop")
+
+# ── single-cell clone table ──
+sc_tab <- clones %>%
+  dplyr::group_by(patient, clone) %>%
+  dplyr::summarise(f_clone   = mean(f), n_cells = sum(n_inf),
+                   genes     = paste(sort(gene), collapse = "\n"),
+                   has_srsf2 = any(gene == "SRSF2"), .groups = "drop") %>%
+  dplyr::filter(patient %in% multi_gene_pts) %>%
+  dplyr::mutate(cell_bin = cut(n_cells, breaks = c(0, 200, 500, 1000, 2000, Inf),
+                               labels = cell_labs, right = FALSE),
+                size_val = cell_bin)
+
+wes_tab0 <- wes_tab; sc_tab0 <- sc_tab
+
+# ── ANCHOR ON SRSF2: divide every clone's value by the patient's SRSF2 clone ──
+add_relative <- function(df, tag) {
+  ref <- df %>% dplyr::filter(has_srsf2) %>%
+    dplyr::group_by(patient) %>%
+    dplyr::summarise(srsf2_f = max(f_clone), .groups = "drop")
+  dropped <- setdiff(unique(df$patient), ref$patient)
+  if (length(dropped))
+    cat(sprintf("[%s] no SRSF2 clone -> dropped: %s\n", tag, paste(dropped, collapse = ", ")))
+  df %>% dplyr::inner_join(ref, by = "patient") %>%
+    dplyr::mutate(f_rel = f_clone / srsf2_f)
+}
+wes_tab <- add_relative(wes_tab0, "WES")
+sc_tab  <- add_relative(sc_tab0,  "single-cell")
+
+# ── shared upper limit from BOTH panels (so the 1.0 line aligns A vs B) ──
+ymax <- max(c(wes_tab$f_rel, sc_tab$f_rel), na.rm = TRUE) * 1.05
+y_breaks <- sort(unique(c(seq(0, floor(ymax * 2) / 2, by = 0.5), 1)))  # 0,0.5,1,1.5,... + 1
+cat(sprintf("y-axis max ratio = %.2f (breaks: %s)\n", ymax, paste(y_breaks, collapse = ", ")))
+
+# ── SHARED ORDER: single-cell (highest-prevalence on LEFT), WES-only appended ──
+sc_order <- sc_tab %>% dplyr::group_by(patient) %>%
+  dplyr::summarise(s = max(f_clone), .groups = "drop") %>%
+  dplyr::arrange(dplyr::desc(s)) %>% dplyr::pull(patient)
+shared_levels <- c(sc_order, setdiff(unique(wes_tab$patient), sc_order))
+wes_tab <- wes_tab %>% dplyr::mutate(patient = factor(patient, levels = shared_levels))
+sc_tab  <- sc_tab  %>% dplyr::mutate(patient = factor(patient, levels = shared_levels))
+
+# ── shared style helper (NO legend) — labels stay in each patient's column ──
+base_panel <- function(df, ylab) {
+  ggplot(df, aes(x = patient, y = f_rel)) +
+    geom_line(aes(group = patient), colour = "grey80", linewidth = 0.4) +
+    geom_point(aes(fill = has_srsf2, size = size_val), shape = 21, colour = "white") +
+    ggrepel::geom_text_repel(aes(label = genes, colour = has_srsf2),
+                             size = 1.8, fontface = "italic", lineheight = 0.8,
+                             direction = "y",
+                             box.padding = 0.15, point.padding = 0.1,
+                             segment.size = 0.2, segment.colour = "grey70",
+                             max.overlaps = Inf, min.segment.length = 0,
+                             nudge_x = 0.28, hjust = 0) +
+    scale_fill_manual(values = c(`TRUE` = RED, `FALSE` = GREY), guide = "none") +
+    scale_colour_manual(values = c(`TRUE` = RED, `FALSE` = DGREY), guide = "none") +
+    scale_x_discrete(drop = FALSE, expand = expansion(add = 0.9)) +
+    scale_y_continuous(ylab, breaks = y_breaks) +          # NO limits arg (no dropping)
+    coord_cartesian(ylim = c(0, ymax), clip = "off") +     # zoom, don't drop; labels can overflow
+    labs(x = NULL) +
+    theme_classic(base_size = 9) +
+    theme(axis.text = element_text(colour = "black"),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none",
+          plot.tag = element_text(size = 12, face = "bold"))
+}
+
+pA <- base_panel(wes_tab, "CCF relative to SRSF2 (WES)") +
+  scale_size_area(max_size = WES_MAXSZ, breaks = wes_breaks)
+pB <- base_panel(sc_tab, "prevalence relative to SRSF2 (single-cell)") +
+  scale_size_manual(values = sc_sizes, drop = FALSE)
+
+fig <- pA / pB + patchwork::plot_annotation(tag_levels = "A")
+ggsave(file.path(FIG_DIR, "fig_clonality_two_panel_srsf2anchored.pdf"), fig,
+       width = 18.3, height = 20, units = "cm")
+ggsave(file.path(FIG_DIR, "fig_clonality_two_panel_srsf2anchored.png"), fig,
+       width = 18.3, height = 20, units = "cm", dpi = 300)
+
+## ═══════════════════════════════════════════════════════════════════════
+##  STANDALONE LEGEND — manual, circle radii match the panels
+## ═══════════════════════════════════════════════════════════════════════
+wes_sizes <- WES_MAXSZ * sqrt(wes_breaks / max(wes_breaks))
+leg_df <- dplyr::bind_rows(
+  tibble::tibble(block = "SRSF2 status", x = 1,
+                 lab = c("SRSF2 clone", "other clone"), y = c(2, 1),
+                 sz = 3.2, fill = c(RED, GREY)),
+  tibble::tibble(block = "mutations in clone (WES)", x = 1,
+                 lab = as.character(wes_breaks), y = seq_along(wes_breaks),
+                 sz = wes_sizes, fill = GREY),
+  tibble::tibble(block = "cells genotyped (single-cell)", x = 1,
+                 lab = cell_labs, y = seq_along(cell_labs),
+                 sz = as.numeric(sc_sizes), fill = GREY)
+) %>%
+  dplyr::mutate(block = factor(block, levels = c("SRSF2 status",
+                                                 "mutations in clone (WES)",
+                                                 "cells genotyped (single-cell)")))
+pLeg <- ggplot(leg_df, aes(x = x, y = y)) +
+  geom_point(aes(size = sz, fill = fill), shape = 21, colour = "white", stroke = 0.6) +
+  geom_text(aes(x = x + 0.15, label = lab), hjust = 0, size = 2.6) +
+  scale_size_identity() + scale_fill_identity() +
+  facet_wrap(~ block, ncol = 1, scales = "free_y") +
+  scale_x_continuous(limits = c(0.8, 2.2)) +
+  theme_void(base_size = 9) +
+  theme(strip.text = element_text(face = "bold", size = 8, hjust = 0),
+        panel.spacing = unit(6, "pt"), plot.margin = margin(4, 4, 4, 4))
+ggsave(file.path(FIG_DIR, "fig_clonality_legend.pdf"), pLeg, width = 5, height = 8, units = "cm")
+ggsave(file.path(FIG_DIR, "fig_clonality_legend.png"), pLeg, width = 5, height = 8, units = "cm", dpi = 300)
+```
