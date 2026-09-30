@@ -1,5 +1,5 @@
 ---
-title: "Supplementary Figures 2-5"
+title: "Supplementary Figures"
 output: html_document
 ---
 
@@ -8,7 +8,6 @@ output: html_document
   Supp. Fig. 3: % mutated progenitor cells vs blast count (SRSF2 cohort)
   Supp. Fig. 4: differentiation pattern per evolutionary stage (P12, P13)
   Supp. Fig. 5: pseudobulk DE per compartment, SRSF2-mutant vs all healthy controls
-  Run after figure6_srsf2_hsc_signature_analysis.Rmd (Supp. Fig. 5 reads its DE results).
 -->
 
 ```{r setup}
