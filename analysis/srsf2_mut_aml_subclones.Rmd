@@ -1,5 +1,5 @@
 ---
-title: "Figure 5 - SRSF2 subclones: localization, composition and expression"
+title: "SRSF2 subclones: localization, composition and expression"
 output: html_document
 ---
 
