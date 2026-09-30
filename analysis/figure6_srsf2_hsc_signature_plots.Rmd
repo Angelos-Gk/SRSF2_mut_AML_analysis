@@ -1,0 +1,772 @@
+---
+title: "Figure 6 (plots) - SRSF2-mutant vs healthy: HSC signature"
+output: html_document
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(scales)
+  library(cowplot)
+  library(pROC)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(BuenColors)
+  library(grid)
+  library(qs2)
+})
+
+## =========================================================
+## Paths
+## =========================================================
+PROJECT_DIR <- "/path/to/project"
+OBJ_DIR     <- file.path(PROJECT_DIR, "objects")
+DE_OUTDIR   <- file.path(PROJECT_DIR, "ext_DE_pseudo")      # output of figure6_srsf2_hsc_signature_analysis.Rmd
+PLOT_OUTDIR <- file.path(PROJECT_DIR, "plots/figure6")
+dir.create(PLOT_OUTDIR, recursive = TRUE, showWarnings = FALSE)
+
+## =========================================================
+## Inputs
+##   - obj:        preprocessing/scrna/07_bonemarrowmap_annotation.R
+##   - srsf2_nano: nanoranger calls of the SRSF2 cohort
+##   - DE results: figure6_srsf2_hsc_signature_analysis.Rmd
+## =========================================================
+obj         <- qs2::qs_read(file.path(OBJ_DIR, "ext_obj_merge_filt_doublets_removed_norm_scaled_scvi_bonemarmap_passonly_finalanno.qs2"))
+srsf2_nano  <- qs2::qs_read(file.path(OBJ_DIR, "srsf2_nano_combined_filtered.qs2"))
+res_allctrl <- read.csv(file.path(DE_OUTDIR, "DE_vs_all_controls_all_compartments.csv"),
+                        stringsAsFactors = FALSE)
+
+CELLTYPE_COL <- "BoneMarrowMap_CellType_Broad_final"
+
+## final curated HSC signature (figure6_srsf2_hsc_signature_analysis.Rmd)
+UP   <- c("IL1RAP", "F13A1", "PLD1", "CNKSR2", "PRKCD", "HOMER3", "CFD", "COL4A5", "ANKRD18B")
+DOWN <- c("AVP", "ALDH1A1", "CDH7", "TNFSF4", "SH3BP5", "ABI3BP")
+
+## =========================================================
+## SRSF2 status + cohort per cell (same definitions as the analysis script)
+## =========================================================
+srsf2_status <- srsf2_nano %>%
+  dplyr::filter(gene == "SRSF2") %>%
+  dplyr::group_by(bc) %>%
+  dplyr::summarise(
+    srsf2_status = dplyr::if_else(any(mutated == "mutated"), "mutated", "wildtype"),
+    .groups = "drop"
+  )
+obj$srsf2_status <- srsf2_status$srsf2_status[match(colnames(obj), srsf2_status$bc)]
+
+oi <- as.character(obj$orig.ident)
+obj$cohort <- dplyr::case_when(
+  oi %in% c("HD1", "HD2")               ~ "healthy_internal",
+  oi %in% c("HD3", "HD4", "HD5", "HD6") ~ "healthy_external",   # GSE247531 CD34+ donors
+  TRUE                                  ~ "patient"
+)
+
+## join the per-sample RNA layers once (module scores / expression across samples)
+DefaultAssay(obj) <- "RNA"
+obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+print(Layers(obj[["RNA"]]))
+```
+
+```{r HSC volcano (SRSF2-mutant vs all controls)}
+# ============================================================
+# 2) Exclude sex-linked genes
+# ============================================================
+sex_genes <- c(
+  "XIST", "TSIX",
+  "RPS4Y1", "RPS4Y2", "DDX3Y", "KDM5D", "UTY", "EIF1AY",
+  "USP9Y", "ZFY", "TXLNGY", "TMSB4Y", "PRKY", "NLGN4Y",
+  "SRY", "AMELY", "TBL1Y", "PCDH11Y"
+)
+
+res_volcano <- res_allctrl %>%
+  dplyr::filter(!gene %in% sex_genes)
+
+# ============================================================
+# 3) Genes of interest to always label, regardless of top-N ranking
+# ============================================================
+genes_manual <- c(UP, DOWN)   # final HSC signature (setup chunk)
+
+# ============================================================
+# 4) HSCs-only volcano
+# ============================================================
+PADJ_THRESH <- 0.05
+LFC_THRESH  <- 1
+top_n       <- 10
+
+d <- res_volcano %>%
+  dplyr::filter(compartment == "HSCs", comparison == "vs_all_controls", !is.na(padj))
+
+d$sig <- dplyr::case_when(
+  d$padj < PADJ_THRESH & d$log2FoldChange >  LFC_THRESH ~ "up_mutant",
+  d$padj < PADJ_THRESH & d$log2FoldChange < -LFC_THRESH ~ "up_healthy",
+  TRUE                                                  ~ "ns"
+)
+
+n_up   <- sum(d$sig == "up_mutant")
+n_down <- sum(d$sig == "up_healthy")
+
+# top 10 by padj among significant genes
+top_genes <- d %>%
+  dplyr::filter(sig != "ns") %>%
+  dplyr::arrange(padj) %>%
+  dplyr::slice_head(n = top_n) %>%
+  dplyr::pull(gene)
+
+# check which manually-requested genes are actually present/testable in this compartment
+missing_manual <- setdiff(genes_manual, d$gene)
+if (length(missing_manual)) {
+  cat("NOTE: these requested genes were not found in the HSCs results (not tested / filtered out):\n")
+  print(missing_manual)
+}
+
+label_genes <- union(top_genes, intersect(genes_manual, d$gene))
+
+d$label <- ""
+d$label[d$gene %in% label_genes] <- d$gene[d$gene %in% label_genes]
+
+x_lim <- max(abs(d$log2FoldChange), na.rm = TRUE) * 1.05
+y_lim <- max(-log10(d$padj), na.rm = TRUE) * 1.05
+x_breaks <- sort(unique(c(seq(-floor(x_lim), floor(x_lim), by = 2), -LFC_THRESH, LFC_THRESH, 0)))
+y_breaks <- sort(unique(c(pretty(c(0, y_lim)), round(-log10(PADJ_THRESH), 2))))
+
+d <- d %>% dplyr::arrange(sig == "ns")
+
+p <- ggplot(d, aes(log2FoldChange, -log10(padj), color = sig, size = sig, alpha = sig)) +
+  geom_point() +
+  scale_color_manual(
+    values = c(ns = "grey75", up_mutant = "#d24163", up_healthy = "#3B7FB6"),
+    labels = c(ns = "NS", up_mutant = "Up in MUTANT", up_healthy = "Up in HEALTHY"),
+    name   = NULL
+  ) +
+  scale_size_manual(values = c(ns = 0.6, up_mutant = 1.4, up_healthy = 1.4), guide = "none") +
+  scale_alpha_manual(values = c(ns = 0.35, up_mutant = 0.85, up_healthy = 0.85), guide = "none") +
+  geom_vline(xintercept = c(-LFC_THRESH, LFC_THRESH), linetype = 2, color = "grey85", linewidth = 0.3) +
+  geom_hline(yintercept = -log10(PADJ_THRESH), linetype = 2, color = "grey85", linewidth = 0.3) +
+  ggrepel::geom_text_repel(
+    aes(label = label), size = 2.6, color = "black",
+    max.overlaps = Inf, min.segment.length = 0,
+    segment.size = 0.25, box.padding = 0.35, seed = 1,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(limits = c(-x_lim, x_lim), breaks = x_breaks) +
+  scale_y_continuous(limits = c(0, y_lim), breaks = y_breaks) +
+  labs(
+    title = sprintf("HSCs (%d up / %d down)", n_up, n_down),
+    x     = "log2 FC (MUTANT / HEALTHY)",
+    y     = "-log10 padj"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title      = element_text(size = 12, face = "bold", hjust = 0.5),
+    axis.title      = element_text(size = 10),
+    axis.text       = element_text(size = 9, color = "black"),
+    legend.position = "bottom",
+    legend.text     = element_text(size = 9)
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+
+# ============================================================
+# 5) Save
+# ============================================================
+ggsave(
+  file.path(PLOT_OUTDIR, "volcano_HSCs_vs_all_controls.pdf"),
+  p, width = 14, height = 12, units = "cm", useDingbats = FALSE
+)
+ggsave(
+  file.path(PLOT_OUTDIR, "volcano_HSCs_vs_all_controls.png"),
+  p, width = 14, height = 12, units = "cm", dpi = 300, bg = "white"
+)
+```
+
+```{r HSC donor contribution}
+# ============================================================
+# 0) SETTINGS (SRSF2 status + cohort: setup chunk)
+# ============================================================
+MIN_CELLS <- 10
+
+# ============================================================
+# 2) Assign condition/group per cell, restricted to HSCs
+# ============================================================
+md <- obj@meta.data %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::mutate(
+    orig.ident  = as.character(orig.ident),
+    compartment = as.character(.data[[CELLTYPE_COL]])
+  ) %>%
+  dplyr::filter(compartment == "HSCs") %>%
+  dplyr::mutate(
+    group = dplyr::case_when(
+      cohort == "patient" & srsf2_status == "mutated" ~ "MUTANT",
+      cohort == "healthy_internal"                    ~ "HEALTHY_internal",
+      cohort == "healthy_external"                    ~ "HEALTHY_external",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  dplyr::filter(!is.na(group))
+
+# ============================================================
+# 3) Cells per donor, only donors passing MIN_CELLS (matches DE filter)
+#    x-axis uses the "sample" label (P#/HD#), not raw orig.ident
+# ============================================================
+sample_map <- obj@meta.data %>%
+  dplyr::select(orig.ident, sample) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(
+    orig.ident = as.character(orig.ident),
+    sample     = as.character(sample)
+  )
+
+donor_counts <- md %>%
+  dplyr::count(group, orig.ident, name = "n_cells") %>%
+  dplyr::left_join(sample_map, by = "orig.ident") %>%
+  dplyr::mutate(donor = dplyr::coalesce(sample, orig.ident)) %>%
+  dplyr::filter(n_cells >= MIN_CELLS)
+
+cat("HSCs donor contribution (passed >=", MIN_CELLS, "cells):\n")
+print(as.data.frame(donor_counts %>% dplyr::arrange(group, dplyr::desc(n_cells))), row.names = FALSE)
+
+# ============================================================
+# 4) Plot: cells per donor, ordered by group then descending count
+# ============================================================
+group_colors <- c(
+  "MUTANT"           = "#d24163",
+  "HEALTHY_internal" = "#3B7FB6",
+  "HEALTHY_external" = "#8EC7E8"
+)
+
+donor_counts <- donor_counts %>%
+  dplyr::mutate(group = factor(group, levels = names(group_colors))) %>%
+  dplyr::arrange(group, dplyr::desc(n_cells))
+
+donor_counts$donor <- factor(donor_counts$donor, levels = donor_counts$donor)
+
+p <- ggplot(donor_counts, aes(x = donor, y = n_cells, fill = group)) +
+  geom_col(color = "black", linewidth = 0.2, width = 0.75) +
+  geom_text(
+    aes(label = n_cells),
+    vjust = -0.4,
+    size  = 2.8,
+    color = "black"
+  ) +
+  geom_hline(yintercept = MIN_CELLS, linetype = 2, color = "grey30", linewidth = 0.3) +
+  scale_fill_manual(values = group_colors, name = "Group") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "HSCs — donor contribution",
+    x = NULL,
+    y = "Number of cells"
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    plot.title      = element_text(size = 11, face = "bold", hjust = 0.5),
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8, color = "black"),
+    axis.text.y     = element_text(size = 8, color = "black"),
+    axis.title.y    = element_text(size = 9, face = "bold"),
+    legend.position = "bottom",
+    legend.text     = element_text(size = 8),
+    legend.title    = element_text(size = 8, face = "bold"),
+    legend.key.size = unit(0.35, "cm")
+  )
+
+# ============================================================
+# 5) Save
+# ============================================================
+ggsave(
+  file.path(PLOT_OUTDIR, "HSCs_sample_composition.pdf"),
+  p, width = 14, height = 9, units = "cm", useDingbats = FALSE
+)
+ggsave(
+  file.path(PLOT_OUTDIR, "HSCs_sample_composition.png"),
+  p, width = 14, height = 9, units = "cm", dpi = 300, bg = "white"
+)
+```
+
+```{r HSC signature UMAPs}
+# (SRSF2 status, cohort, joined RNA layers and UP/DOWN genes: setup chunk)
+
+SCORECOL <- "HSC_SIG_score"
+
+# ============================================================
+# 3) Score ALL cells (not just HSCs) with the HSC signature
+# ============================================================
+obj <- AddModuleScore(obj, features = list(intersect(UP,   rownames(obj))), name = "hscUPm",   seed = 1)
+obj <- AddModuleScore(obj, features = list(intersect(DOWN, rownames(obj))), name = "hscDOWNm", seed = 1)
+obj[[SCORECOL]] <- obj$hscUPm1 - obj$hscDOWNm1
+
+# ============================================================
+# 4) Cell groups: patient vs healthy (internal + external combined)
+# ============================================================
+patient_cells <- colnames(obj)[obj$cohort == "patient"]
+healthy_cells <- colnames(obj)[obj$cohort %in% c("healthy_internal", "healthy_external")]
+
+red <- if ("umap_projected" %in% Reductions(obj)) "umap_projected" else
+       if ("umap" %in% Reductions(obj)) "umap" else Reductions(obj)[1]
+
+# ============================================================
+# 5) Shared color scale across BOTH panels (so they're directly comparable)
+# ============================================================
+score_vals <- obj[[SCORECOL]][, 1]
+rng <- as.numeric(quantile(score_vals, c(0.10, 0.99), na.rm = TRUE))
+
+sig_scale <- scale_colour_viridis_c(
+  option    = "magma",
+  direction = -1,
+  limits    = rng,
+  oob       = scales::squish,
+  name      = "HSC SIG\nscore",
+  guide     = guide_colourbar(frame.colour = "black", ticks.colour = "black")
+)
+
+umap_theme <- theme_classic(base_size = 14) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 9, hjust = 0.5),
+    axis.title      = element_text(face = "bold", size = 9),
+    axis.text       = element_blank(),
+    axis.ticks      = element_blank(),
+    panel.grid      = element_blank(),
+    panel.border    = element_blank(),
+    legend.position = "none"
+  )
+
+# ============================================================
+# 5b) Shared axis limits, computed from the FULL embedding
+#     (so both panels use identical framing/zoom, not just a
+#     bounding box of whichever cells happen to be shown)
+# ============================================================
+emb_full <- Embeddings(obj, reduction = red)[, 1:2]
+x_range <- range(emb_full[, 1])
+y_range <- range(emb_full[, 2])
+pad_x   <- diff(x_range) * 0.03
+pad_y   <- diff(y_range) * 0.03
+shared_coord <- coord_cartesian(
+  xlim = c(x_range[1] - pad_x, x_range[2] + pad_x),
+  ylim = c(y_range[1] - pad_y, y_range[2] + pad_y)
+)
+
+# ============================================================
+# 5c) Median signature score per group, for on-plot annotation
+# ============================================================
+median_patient <- median(obj[[SCORECOL]][patient_cells, 1], na.rm = TRUE)
+median_healthy <- median(obj[[SCORECOL]][healthy_cells, 1], na.rm = TRUE)
+w_test <- wilcox.test(
+  obj[[SCORECOL]][patient_cells, 1],
+  obj[[SCORECOL]][healthy_cells, 1]
+)
+cat(sprintf("Median SIG score — patient: %.3f | healthy: %.3f | Wilcoxon p = %.3g\n",
+            median_patient, median_healthy, w_test$p.value))
+
+# ============================================================
+# 5d) (arrows removed — using plain axis titles instead,
+#     matching your established UMAP styling convention)
+# ============================================================
+
+# ============================================================
+# 5e) Build plain data.frames for direct ggplot2 plotting
+#     (avoids Seurat's FeaturePlot patchwork wrapper entirely,
+#     giving full manual control over legend/theme/arrows)
+# ============================================================
+score_all <- setNames(obj@meta.data[[SCORECOL]], rownames(obj@meta.data))
+
+build_plot_df <- function(cells) {
+  df <- data.frame(
+    UMAP_1 = emb_full[cells, 1],
+    UMAP_2 = emb_full[cells, 2],
+    score  = score_all[cells]
+  )
+  n_na <- sum(is.na(df$score))
+  if (n_na > 0) cat(sprintf("Dropping %d cells with NA score\n", n_na))
+  df <- df[!is.na(df$score), ]
+  # order ascending so highest-score cells are drawn last (on top),
+  # mirroring FeaturePlot's order = TRUE behavior
+  df[order(df$score), ]
+}
+
+plot_df_patient <- build_plot_df(patient_cells)
+plot_df_healthy <- build_plot_df(healthy_cells)
+
+# ============================================================
+# 6) Build the two panels — SAME embedding, only cells shown differ
+# ============================================================
+p_patient <- ggplot(plot_df_patient, aes(x = UMAP_1, y = UMAP_2, color = score)) +
+  geom_point(size = 0.00001) +
+  sig_scale +
+  shared_coord +
+  xlab("UMAP 1") + ylab("UMAP 2") +
+  labs(title = "Patient samples") +
+  umap_theme
+
+p_healthy <- ggplot(plot_df_healthy, aes(x = UMAP_1, y = UMAP_2, color = score)) +
+  geom_point(size = 0.00001) +
+  sig_scale +
+  shared_coord +
+  xlab("UMAP 1") + ylab("UMAP 2") +
+  labs(title = "Healthy samples") +
+  umap_theme
+
+# ============================================================
+# 7) Standalone legend, saved as its own file
+# ============================================================
+p_for_legend <- ggplot(plot_df_patient, aes(x = UMAP_1, y = UMAP_2, color = score)) +
+  geom_point(size = 0.4) +
+  sig_scale +
+  theme(legend.position = "right")
+
+legend_grob <- cowplot::get_legend(p_for_legend)
+legend_plot <- cowplot::ggdraw(legend_grob)
+
+# ============================================================
+# 8) Save — each UMAP saved separately, identical dimensions,
+#    plus one standalone legend
+# ============================================================
+PANEL_WIDTH  <- 10
+PANEL_HEIGHT <- 14
+
+ggsave(
+  file.path(PLOT_OUTDIR, "HSC_signature_UMAP_patient.pdf"),
+  p_patient, width = PANEL_WIDTH, height = PANEL_HEIGHT, units = "cm", useDingbats = FALSE
+)
+ggsave(
+  file.path(PLOT_OUTDIR, "HSC_signature_UMAP_patient.png"),
+  p_patient, width = PANEL_WIDTH, height = PANEL_HEIGHT, units = "cm", dpi = 300, bg = "white"
+)
+ggsave(
+  file.path(PLOT_OUTDIR, "HSC_signature_UMAP_healthy.pdf"),
+  p_healthy, width = PANEL_WIDTH, height = PANEL_HEIGHT, units = "cm", useDingbats = FALSE
+)
+ggsave(
+  file.path(PLOT_OUTDIR, "HSC_signature_UMAP_healthy.png"),
+  p_healthy, width = PANEL_WIDTH, height = PANEL_HEIGHT, units = "cm", dpi = 300, bg = "white"
+)
+ggsave(
+  file.path(PLOT_OUTDIR, "HSC_signature_UMAP_legend.pdf"),
+  legend_plot, width = 4, height = 6, units = "cm", useDingbats = FALSE
+)
+ggsave(
+  file.path(PLOT_OUTDIR, "HSC_signature_UMAP_legend.png"),
+  legend_plot, width = 4, height = 6, units = "cm", dpi = 300, bg = "white"
+)
+```
+
+```{r HSC signature per-donor barplot and ROC}
+COMP <- "HSCs"
+# (SRSF2 status, cohort, joined RNA layers and UP/DOWN genes: setup chunk)
+
+# ============================================================
+# 2) Score WITHIN the HSC compartment only (matches original
+#    signature validation — donor-level Wilcoxon + AUROC)
+# ============================================================
+sub <- subset(obj, cells = colnames(obj)[which(obj@meta.data[[CELLTYPE_COL]] == COMP)])
+sub <- AddModuleScore(sub, features = list(intersect(UP,   rownames(sub))), name = "UPm",   seed = 1)
+sub <- AddModuleScore(sub, features = list(intersect(DOWN, rownames(sub))), name = "DOWNm", seed = 1)
+sub$SIG_score <- sub$UPm1 - sub$DOWNm1
+
+class2 <- function(cohort, status) dplyr::case_when(
+  cohort == "patient" & status == "mutated"             ~ "MUTANT",
+  cohort %in% c("healthy_internal", "healthy_external")  ~ "HEALTHY",
+  TRUE                                                   ~ NA_character_
+)
+sub$class <- class2(sub$cohort, sub$srsf2_status)
+
+md <- sub@meta.data %>%
+  dplyr::mutate(donor = as.character(orig.ident),
+                class = class2(cohort, srsf2_status)) %>%
+  dplyr::filter(!is.na(class)) %>%
+  dplyr::mutate(class  = factor(class, levels = c("MUTANT", "HEALTHY")),
+                is_mut = as.integer(class == "MUTANT"))
+
+# ============================================================
+# 3) Donor-level means + Wilcoxon test
+# ============================================================
+donor_mean <- md %>%
+  dplyr::group_by(donor, class) %>%
+  dplyr::summarise(score = mean(SIG_score), n = dplyr::n(), .groups = "drop") %>%
+  dplyr::mutate(lab = donor)
+
+w <- wilcox.test(score ~ class, data = donor_mean)
+cat(sprintf("Donor Wilcoxon MUT(%d) vs HEALTHY(%d): p = %.5g\n",
+            sum(donor_mean$class == "MUTANT"), sum(donor_mean$class == "HEALTHY"), w$p.value))
+
+# ============================================================
+# 4) Per-cell AUROC
+# ============================================================
+roc_obj <- pROC::roc(md$is_mut, md$SIG_score, quiet = TRUE, ci = TRUE)
+cat(sprintf("Per-cell AUROC = %.3f (%.3f-%.3f)\n",
+            as.numeric(roc_obj$auc), roc_obj$ci[1], roc_obj$ci[3]))
+
+# ============================================================
+# 5) Colors — matching Panel C's barplot scheme
+# ============================================================
+COLS2 <- c(MUTANT = "#d24163", HEALTHY = "#3B7FB6")
+
+# ============================================================
+# 6) Publication theme
+# ============================================================
+theme_pub <- theme_classic(base_size = 10) +
+  theme(
+    axis.text        = element_text(colour = "black", size = 8.5),
+    axis.title       = element_text(size = 9.5),
+    axis.ticks       = element_line(colour = "black"),
+    axis.line        = element_line(colour = "black", linewidth = 0.4),
+    plot.title       = element_text(face = "bold", hjust = 0.5, size = 10),
+    legend.key       = element_blank(),
+    legend.background = element_blank(),
+    legend.position  = "none"
+  )
+
+# ============================================================
+# 7) Per-donor bar plot (MUTANT first, then HEALTHY)
+#    x-axis labels use the P#/HD# sample naming convention
+# ============================================================
+sample_map <- obj@meta.data %>%
+  dplyr::select(orig.ident, sample) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(
+    orig.ident = as.character(orig.ident),
+    sample     = as.character(sample)
+  )
+
+donor_bar <- donor_mean %>%
+  dplyr::left_join(sample_map, by = c("donor" = "orig.ident")) %>%
+  dplyr::mutate(
+    lab   = dplyr::coalesce(sample, donor),
+    class = factor(class, levels = c("MUTANT", "HEALTHY"))
+  ) %>%
+  dplyr::arrange(class, dplyr::desc(score)) %>%
+  dplyr::mutate(lab = factor(lab, levels = lab))
+
+p_bar <- ggplot(donor_bar, aes(lab, score, fill = class)) +
+  geom_col(width = 0.7, colour = "black", linewidth = 0.3) +
+  geom_hline(yintercept = 0, linewidth = 0.4) +
+  scale_fill_manual(values = COLS2, name = NULL) +
+  labs(x = NULL, y = "Mean signature score") +
+  theme_pub +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 7),
+    plot.title      = element_text(face = "bold", hjust = 0.5, size = 8.5),
+    legend.position = "none",
+    legend.text     = element_text(size = 8),
+    legend.key.size = unit(0.35, "cm")
+  )
+
+# ============================================================
+# 8) ROC curve
+# ============================================================
+roc_df <- data.frame(fpr = 1 - roc_obj$specificities, tpr = roc_obj$sensitivities)
+
+p_roc <- ggplot(roc_df, aes(fpr, tpr)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey70") +
+  geom_path(colour = COLS2["MUTANT"], linewidth = 0.9) +
+  annotate("text", x = 0.5, y = 0.12, hjust = 0, size = 3,
+           label = sprintf("AUROC = %.3f\n(%.3f-%.3f)",
+                           as.numeric(roc_obj$auc), roc_obj$ci[1], roc_obj$ci[3])) +
+  labs(x = "False positive rate", y = "True positive rate",
+       title = sprintf("%s SRSF2 signature — per-cell ROC", COMP)) +
+  coord_equal() + theme_pub
+
+# ============================================================
+# 9) Save — EACH PANEL SEPARATELY
+# ============================================================
+ggsave(
+  file.path(PLOT_OUTDIR, "panelE_HSC_signature_perdonor_bar.pdf"),
+  p_bar, width = 10, height = 6, units = "cm", useDingbats = FALSE
+)
+ggsave(
+  file.path(PLOT_OUTDIR, "panelE_HSC_signature_perdonor_bar.png"),
+  p_bar, width = 10, height = 6, units = "cm", dpi = 300, bg = "white"
+)
+ggsave(
+  file.path(PLOT_OUTDIR, "panelE_HSC_signature_ROC.pdf"),
+  p_roc, width = 10, height = 6, units = "cm", useDingbats = FALSE
+)
+ggsave(
+  file.path(PLOT_OUTDIR, "panelE_HSC_signature_ROC.png"),
+  p_roc, width = 10, height = 6, units = "cm", dpi = 300, bg = "white"
+)
+```
+
+```{r IL1RAP heatmap per sample and cell type}
+GENE <- "IL1RAP"
+
+# ============================================================
+# 2) Row / column order — NOW INCLUDES HEALTHY CONTROLS (HD1-HD6)
+# ============================================================
+patient_samples <- paste0("P", 1:17)
+healthy_samples <- paste0("HD", 1:6)
+sample_order    <- c(patient_samples, healthy_samples)
+
+celltype_order <- c(
+  "HSCs", "GMPs", "MEPs", "Lymphoid progenitors", "Monocytes",
+  "Dendritic cells", "Erythroid-like cells", "T-cells", "B-cells", "NK cells"
+)
+
+# ============================================================
+# 3) Pull IL1RAP expression + sample/celltype metadata for
+#    BOTH patient and healthy control cells
+# ============================================================
+expr_df <- FetchData(obj, vars = c(GENE, "sample")) %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::mutate(
+    sample   = as.character(sample),
+    celltype = as.character(obj@meta.data[[CELLTYPE_COL]])
+  ) %>%
+  dplyr::filter(sample %in% sample_order, celltype %in% celltype_order)
+
+# ============================================================
+# 4) Mean expression per sample x celltype
+# ============================================================
+mean_df <- expr_df %>%
+  dplyr::group_by(sample, celltype) %>%
+  dplyr::summarise(mean_expr = mean(.data[[GENE]]), n_cells = dplyr::n(), .groups = "drop")
+
+cat(sprintf("Sample x celltype combinations with data: %d / %d\n",
+            nrow(mean_df), length(sample_order) * length(celltype_order)))
+
+# ============================================================
+# 5) Build matrix (rows = samples, cols = celltypes), NA where missing
+# ============================================================
+mat <- mean_df %>%
+  dplyr::select(sample, celltype, mean_expr) %>%
+  tidyr::pivot_wider(names_from = celltype, values_from = mean_expr) %>%
+  tibble::column_to_rownames("sample")
+
+mat <- mat[sample_order, celltype_order]
+mat <- as.matrix(mat)
+
+# ============================================================
+# 6) Color scale
+# ============================================================
+solar_rojos_colors <- BuenColors::jdb_palette("solar_rojos")
+
+col_fun <- circlize::colorRamp2(
+  seq(0, max(mat, na.rm = TRUE), length.out = length(solar_rojos_colors)),
+  solar_rojos_colors
+)
+
+# ============================================================
+# 6b) Row clustering, computed on an NA-imputed copy, SEPARATELY
+#     within patients and within healthy controls (so clustering
+#     doesn't mix the two groups together)
+# ============================================================
+mat_for_clust <- mat
+for (j in seq_len(ncol(mat_for_clust))) {
+  col_mean <- mean(mat_for_clust[, j], na.rm = TRUE)
+  mat_for_clust[is.na(mat_for_clust[, j]), j] <- col_mean
+}
+
+row_dend_patient <- hclust(dist(mat_for_clust[patient_samples, ], method = "euclidean"), method = "complete")
+row_dend_healthy <- hclust(dist(mat_for_clust[healthy_samples, ], method = "euclidean"), method = "complete")
+
+row_order_combined <- c(
+  patient_samples[row_dend_patient$order],
+  healthy_samples[row_dend_healthy$order]
+)
+
+# ============================================================
+# 6c) Top annotation: celltype color bar
+# ============================================================
+celltype_colors <- c(
+  "HSCs"                 = "#d24163",
+  "GMPs"                 = "#4d8445",
+  "MEPs"                 = "darkorange",
+  "Lymphoid progenitors" = "#3e2664",
+  "Monocytes"            = "#5bb94d",
+  "Dendritic cells"      = "#a1af47",
+  "Erythroid-like cells" = "#bd7533",
+  "T-cells"              = "#8DA0CB",
+  "B-cells"              = "#A6761D",
+  "NK cells"             = "#c959ad"
+)
+
+top_anno <- ComplexHeatmap::HeatmapAnnotation(
+  celltype = celltype_order,
+  col = list(celltype = celltype_colors),
+  annotation_name_gp = gpar(fontsize = 7),
+  show_legend = FALSE,
+  simple_anno_size = unit(0.25, "cm"),
+  gp = gpar(col = "black", lwd = 1)
+)
+
+# ============================================================
+# 6d) (row group annotation omitted per request — row_split still
+#     visually separates Patient/Healthy blocks via the gap + border)
+# ============================================================
+group_colors <- c("Patient" = "#d24163", "Healthy" = "#3B7FB6")
+row_group <- ifelse(row_order_combined %in% patient_samples, "Patient", "Healthy")
+
+# ============================================================
+# 7) Heatmap
+# ============================================================
+ht <- ComplexHeatmap::Heatmap(
+  mat,
+  name              = "Mean\nexpression",
+  col               = col_fun,
+  na_col            = "grey90",
+  cluster_rows      = FALSE,
+  row_order         = row_order_combined,
+  cluster_columns   = FALSE,
+  column_order      = celltype_order,
+  show_column_names = FALSE,
+  top_annotation    = top_anno,
+  row_names_side    = "left",
+  row_names_gp      = gpar(fontsize = 7),
+  rect_gp           = gpar(col = "white", lwd = 0.6),
+  show_heatmap_legend = FALSE,
+  row_split         = factor(row_group, levels = c("Patient", "Healthy")),
+  row_gap           = unit(1.5, "mm"),
+  row_title         = NULL,
+  border            = TRUE,
+  border_gp         = gpar(col = "black", lwd = 1.2)
+)
+
+# ============================================================
+# 8) Save heatmap (no legends)
+# ============================================================
+pdf(file.path(PLOT_OUTDIR, sprintf("heatmap_%s_patients_and_healthy.pdf", GENE)),
+    width = 8 / 2.54, height = 9 / 2.54)
+draw(ht, show_heatmap_legend = FALSE, show_annotation_legend = FALSE)
+dev.off()
+
+png(file.path(PLOT_OUTDIR, sprintf("heatmap_%s_patients_and_healthy.png", GENE)),
+    width = 8, height = 9, units = "cm", res = 300)
+draw(ht, show_heatmap_legend = FALSE, show_annotation_legend = FALSE)
+dev.off()
+
+# ============================================================
+# 9) Build + save legends separately
+# ============================================================
+lgd_expr <- ComplexHeatmap::Legend(
+  col_fun    = col_fun,
+  title      = "Mean\nexpression",
+  title_gp   = gpar(fontsize = 8, fontface = "bold"),
+  labels_gp  = gpar(fontsize = 7),
+  border     = "black"
+)
+
+lgd_celltype <- ComplexHeatmap::Legend(
+  labels     = celltype_order,
+  legend_gp  = gpar(fill = celltype_colors[celltype_order], col = "black"),
+  title      = "Celltype",
+  title_gp   = gpar(fontsize = 8, fontface = "bold"),
+  labels_gp  = gpar(fontsize = 7)
+)
+
+lgd_list <- ComplexHeatmap::packLegend(lgd_expr, lgd_celltype, direction = "vertical")
+
+pdf(file.path(PLOT_OUTDIR, sprintf("heatmap_%s_legends.pdf", GENE)),
+    width = 4 / 2.54, height = 8 / 2.54)
+grid::grid.newpage()
+draw(lgd_list)
+dev.off()
+
+png(file.path(PLOT_OUTDIR, sprintf("heatmap_%s_legends.png", GENE)),
+    width = 4, height = 8, units = "cm", res = 300)
+grid::grid.newpage()
+draw(lgd_list)
+dev.off()
+```
