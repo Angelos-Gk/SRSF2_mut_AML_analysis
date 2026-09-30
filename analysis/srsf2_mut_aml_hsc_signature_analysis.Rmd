@@ -1,5 +1,5 @@
 ---
-title: "Figure 6 (analysis) - SRSF2-mutant vs healthy: pseudobulk DE and HSC signature"
+title: "SRSF2-mutant vs healthy: pseudobulk DE and HSC signature"
 output: html_document
 ---
 
