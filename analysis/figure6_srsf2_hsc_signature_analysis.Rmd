@@ -1,0 +1,448 @@
+---
+title: "Figure 6 (analysis) - SRSF2-mutant vs healthy: pseudobulk DE and HSC signature"
+output: html_document
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(DESeq2)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(pROC)
+  library(qs2)
+})
+## dplyr verbs used unprefixed below (avoid masking by Seurat/Matrix/other packages)
+select   <- dplyr::select;   filter    <- dplyr::filter;    mutate   <- dplyr::mutate
+arrange  <- dplyr::arrange;  rename    <- dplyr::rename;    count    <- dplyr::count
+summarise <- dplyr::summarise; group_by <- dplyr::group_by; distinct <- dplyr::distinct
+pull     <- dplyr::pull;     inner_join <- dplyr::inner_join
+
+## =========================================================
+## Paths
+## =========================================================
+PROJECT_DIR <- "/path/to/project"
+OBJ_DIR     <- file.path(PROJECT_DIR, "objects")
+OUTDIR      <- file.path(PROJECT_DIR, "ext_DE_pseudo")          # DE / curation tables
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+
+## =========================================================
+## Inputs
+##   - obj:        preprocessing/scrna/07_bonemarrowmap_annotation.R
+##   - srsf2_nano: nanoranger calls of the SRSF2 cohort
+## =========================================================
+obj        <- qs2::qs_read(file.path(OBJ_DIR, "ext_obj_merge_filt_doublets_removed_norm_scaled_scvi_bonemarmap_passonly_finalanno.qs2"))
+srsf2_nano <- qs2::qs_read(file.path(OBJ_DIR, "srsf2_nano_combined_filtered.qs2"))
+
+## join the per-sample RNA layers once (pseudobulk + module scores need one counts/data layer)
+DefaultAssay(obj) <- "RNA"
+obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+print(Layers(obj[["RNA"]]))
+
+CELLTYPE_COL <- "BoneMarrowMap_CellType_Broad_final"
+```
+
+```{r subset nanoranger calls to cells in the Seurat object}
+## srsf2_nano already in memory (tibble, 173,015 x 8)
+cells_seurat <- colnames(obj)
+
+## --- barcode-format sanity check (STOP if these don't overlap) ---
+ov <- mean(unique(srsf2_nano$bc) %in% cells_seurat)
+cat(sprintf("nano barcodes matching obj1 cells: %.1f%%\n", 100*ov))
+cat("example nano bc :", head(srsf2_nano$bc, 3), "\n")
+cat("example obj bc :", head(cells_seurat, 3), "\n")
+if (ov < 0.05) stop("Barcode formats don't match — inspect the two 'example' lines above ",
+                    "and reformat srsf2_nano$bc (or obj1 colnames) before continuing.")
+
+## subset to genotyping records whose cell is in the Seurat object
+srsf2_nano_filt <- srsf2_nano %>% dplyr::filter(bc %in% cells_seurat)
+cat(sprintf("nano rows: %d -> %d (kept %d unique cells)\n",
+            nrow(srsf2_nano), nrow(srsf2_nano_filt),
+            dplyr::n_distinct(srsf2_nano_filt$bc)))
+```
+
+```{r SRSF2 status and cohort per cell}
+cat("\nGenes genotyped in nano:\n"); print(sort(table(srsf2_nano_filt$gene), decreasing = TRUE))
+
+## SRSF2 records only; collapse to one status per cell (mutated if ANY mutated record)
+srsf2_status <- srsf2_nano_filt %>%
+  filter(gene == "SRSF2") %>%
+  group_by(bc) %>%
+  summarise(srsf2_status = if_else(any(mutated == "mutated"), "mutated", "wildtype"),
+            .groups = "drop")
+
+cat("\nSRSF2 genotyped cells (that are in obj1):\n"); print(table(srsf2_status$srsf2_status))
+
+## map onto obj (cells with no SRSF2 record -> NA)
+obj$srsf2_status <- srsf2_status$srsf2_status[match(colnames(obj), srsf2_status$bc)]
+
+## cohort / chemistry from orig.ident
+oi <- as.character(obj$orig.ident)
+obj$cohort <- dplyr::case_when(
+  oi %in% c("HD1","HD2")                ~ "healthy_internal",
+  oi %in% c("HD3","HD4","HD5","HD6")    ~ "healthy_external",   # GSE247531 CD34+ donors
+  TRUE                          ~ "patient")
+obj$chemistry <- ifelse(obj$cohort == "healthy_external", "v1_old", "GEMX")
+
+cat("\nCohort x SRSF2 status:\n")
+print(table(obj$cohort, obj$srsf2_status, useNA = "ifany"))
+```
+
+```{r cell count table}
+MIN_CELLS    <- 10
+MIN_DONORS   <- 2
+## MUTANT cells = patient & SRSF2-mutated ; HEALTHY = the two control sets
+md <- obj@meta.data %>% rownames_to_column("cell")
+
+count_tab <- md %>%
+  dplyr::mutate(grp = dplyr::case_when(
+    cohort == "patient" & srsf2_status == "mutated" ~ "MUTANT",
+    cohort == "healthy_internal"                    ~ "HEALTHY_internal",
+    cohort == "healthy_external"                    ~ "HEALTHY_external",
+    TRUE ~ NA_character_)) %>%
+  dplyr::filter(!is.na(grp)) %>%
+  dplyr::count(orig.ident, .data[[CELLTYPE_COL]], grp) %>%
+  tidyr::pivot_wider(names_from = grp, values_from = n, values_fill = 0)
+
+write.csv(count_tab, file.path(OUTDIR, "cellcounts_donor_by_compartment.csv"), row.names = FALSE)
+print(as.data.frame(count_tab))
+```
+
+```{r pseudobulk DESeq2 functions}
+## compartments to test (restricts both comparisons)
+COMPARTMENTS <- c("HSCs", "GMPs", "MEPs", "Monocytes",
+                  "Lymphoid progenitors", "Erythroid-like cells", "B-cells")
+
+## ---- helper: build pseudobulk & run DESeq2 for one compartment ----
+run_compartment_de <- function(obj, compartment, control_cohorts, tag) {
+
+  md <- obj@meta.data %>% rownames_to_column("cell")
+
+  ## assign each cell to MUTANT or HEALTHY (donor = orig.ident); else drop
+  md <- md %>%
+    dplyr::filter(.data[[CELLTYPE_COL]] == compartment) %>%
+    dplyr::mutate(condition = case_when(
+      cohort == "patient" & srsf2_status == "mutated" ~ "MUTANT",
+      cohort %in% control_cohorts                     ~ "HEALTHY",
+      TRUE ~ NA_character_)) %>%
+    dplyr::filter(!is.na(condition))
+  if (nrow(md) == 0) return(NULL)
+
+  md$donor <- md$orig.ident
+
+  ## keep donor groups with >= MIN_CELLS cells in this compartment
+  keep_don <- md %>% dplyr::count(donor) %>% dplyr::filter(n >= MIN_CELLS) %>% dplyr::pull(donor)
+  md <- md %>% dplyr::filter(donor %in% keep_don)
+
+  ## need >= MIN_DONORS on BOTH sides
+  nd <- md %>% dplyr::distinct(donor, condition) %>% dplyr::count(condition)
+  if (!all(c("MUTANT","HEALTHY") %in% nd$condition) || any(nd$n < MIN_DONORS)) {
+    message(sprintf("  [%s / %s] skipped — donors: %s",
+                    tag, compartment,
+                    paste(nd$condition, nd$n, collapse = ", ")))
+    return(NULL)
+  }
+
+  ## ---- aggregate RAW counts to donor pseudobulk (genes x donors) ----
+  counts <- GetAssayData(obj, assay = "RNA", layer = "counts")[, md$cell, drop = FALSE]
+  gf <- factor(md$donor)
+  mm <- Matrix::sparse.model.matrix(~ 0 + gf)
+  colnames(mm) <- levels(gf)
+  pb <- as.matrix(counts %*% mm)                     # genes x donors
+
+  ## coldata aligned to pseudobulk columns
+  coldata <- md %>% distinct(donor, condition, chemistry) %>%
+    column_to_rownames("donor")
+  coldata <- coldata[colnames(pb), , drop = FALSE]
+  coldata$condition <- factor(coldata$condition, levels = c("HEALTHY","MUTANT"))
+  coldata$chemistry <- factor(coldata$chemistry)
+
+  ## design: add chemistry only if it varies within this compartment
+  design <- if (nlevels(droplevels(coldata$chemistry)) > 1)
+              ~ chemistry + condition else ~ condition
+
+  ## prefilter low-count genes (>=10 counts in >= MIN_DONORS donors)
+  pb <- pb[rowSums(pb >= 10) >= MIN_DONORS, , drop = FALSE]
+
+  ## ---- DESeq2 ----
+  dds <- DESeqDataSetFromMatrix(pb, coldata, design = design)
+  dds <- DESeq(dds)
+  res <- results(dds, contrast = c("condition","MUTANT","HEALTHY"))
+  res <- lfcShrink(dds, contrast = c("condition","MUTANT","HEALTHY"),
+                   res = res, type = "ashr")         # shrink LFC for ranking
+
+  out <- as.data.frame(res) %>% rownames_to_column("gene") %>%
+    arrange(padj) %>%
+    mutate(compartment = compartment,
+           comparison  = tag,
+           n_mutant    = sum(coldata$condition == "MUTANT"),
+           n_healthy   = sum(coldata$condition == "HEALTHY"),
+           design      = paste(deparse(design), collapse = ""))
+
+  message(sprintf("  [%s / %s] OK — %d MUT vs %d HEALTHY donors, %d genes tested",
+                  tag, compartment, out$n_mutant[1], out$n_healthy[1], nrow(out)))
+  out
+}
+
+## ---- driver: loop whitelisted compartments for a given control set ----
+run_all <- function(obj, control_cohorts, tag) {
+  comps <- obj@meta.data %>%
+    filter((cohort == "patient" & srsf2_status == "mutated") |
+             cohort %in% control_cohorts) %>%
+    pull(.data[[CELLTYPE_COL]]) %>% unique() %>% na.omit()
+  comps <- intersect(COMPARTMENTS, comps)            # restrict to whitelist
+  message("Testing compartments: ", paste(comps, collapse = ", "))
+
+  res_list <- lapply(comps, function(cc)
+    tryCatch(run_compartment_de(obj, cc, control_cohorts, tag),
+             error = function(e){ message("  ERROR ", cc, ": ", conditionMessage(e)); NULL }))
+  res <- bind_rows(res_list)
+
+  if (nrow(res)) {
+    write.csv(res, file.path(OUTDIR, sprintf("DE_%s_all_compartments.csv", tag)),
+              row.names = FALSE)
+    for (cc in unique(res$compartment)) {
+      write.csv(filter(res, compartment == cc),
+                file.path(OUTDIR,
+                  sprintf("DE_%s_%s.csv", tag, gsub("[^A-Za-z0-9]+","_",cc))),
+                row.names = FALSE)
+    }
+  }
+  res
+}
+```
+
+```{r run DE (SRSF2-mutant vs all controls)}
+## MUTANT (SRSF2-mutant patient cells) vs ALL controls (HD1, HD2 + external GSE247531 donors HD3-HD6)
+res_allctrl <- run_all(obj, control_cohorts = c("healthy_internal","healthy_external"),
+                       tag = "vs_all_controls")
+
+## quick significant-gene tally
+sig_summary <- res_allctrl %>%
+  dplyr::filter(!is.na(padj)) %>%
+  dplyr::group_by(comparison, compartment) %>%
+  dplyr::summarise(n_sig_padj0.05 = sum(padj < 0.05),
+            n_up   = sum(padj < 0.05 & log2FoldChange > 0),
+            n_down = sum(padj < 0.05 & log2FoldChange < 0), .groups="drop")
+write.csv(sig_summary, file.path(OUTDIR, "DE_significant_summary.csv"), row.names = FALSE)
+print(as.data.frame(sig_summary))
+```
+
+```{r curate significant genes per compartment}
+## ============================================================
+## SRSF2 per-compartment signature CURATION (no plots, no scoring)
+## Uses: obj (cohort / srsf2_status), res_allctrl, CELLTYPE_COL, OUTDIR
+## ============================================================
+## ---------- CONSTANTS ----------
+LFC_CUT        <- 1        # |log2FC| > 1
+PADJ_CUT       <- 0.05
+MIN_CELLS      <- 10       # donors with >= this many cells count toward group means / denominators
+EXPR_PCT_CUT   <- 5        # % cells expressing to call a donor "expressing"
+DOWN_EXT_RATIO <- 1.5      # keep DOWN gene iff (HDext+1)/(MUT+1) >= this  (== "external > mutant")
+PSEUDO         <- 1        # CPM pseudocount for the ratio
+
+## ---------- significant genes (vs all controls) for one compartment ----------
+build_sig <- function(compartment, res_allctrl) {
+  res_allctrl %>%
+    filter(compartment == !!compartment) %>%
+    select(gene, lfc_all = log2FoldChange, padj_all = padj) %>%
+    filter(!is.na(padj_all), padj_all < PADJ_CUT, abs(lfc_all) > LFC_CUT) %>%
+    mutate(direction   = ifelse(lfc_all > 0, "UP_in_MUTANT", "DOWN_in_MUTANT"),
+           compartment = compartment) %>%
+    arrange(direction, desc(abs(lfc_all)))
+}
+
+## ---------- per-donor expression diagnostic for a gene set in one compartment ----------
+donor_diag <- function(obj, compartment, genes,
+                       min_cells = MIN_CELLS, expr_pct_cut = EXPR_PCT_CUT) {
+  genes <- intersect(unique(genes), rownames(obj))
+  if (length(genes) == 0) return(NULL)
+
+  md <- obj@meta.data %>% rownames_to_column("cell") %>%
+    dplyr::filter(.data[[CELLTYPE_COL]] == compartment) %>%
+    dplyr::mutate(donor = as.character(orig.ident),
+                  grp = dplyr::case_when(
+                    cohort == "patient" & srsf2_status == "mutated" ~ "MUTANT",
+                    cohort == "healthy_internal"                    ~ "HEALTHY_internal",
+                    cohort == "healthy_external"                    ~ "HEALTHY_external",
+                    TRUE ~ NA_character_)) %>%
+    dplyr::filter(!is.na(grp))
+  if (nrow(md) == 0) return(NULL)
+
+  cnts <- GetAssayData(obj, assay = "RNA", layer = "counts")[genes, md$cell, drop = FALSE]
+  tot  <- GetAssayData(obj, assay = "RNA", layer = "counts")[,        md$cell, drop = FALSE]
+
+  gf <- factor(md$donor)
+  mm <- Matrix::sparse.model.matrix(~ 0 + gf); colnames(mm) <- levels(gf)
+  pb_gene <- as.matrix(cnts %*% mm)                       # genes x donors: summed counts
+  libsize <- as.numeric(Matrix::colSums(tot) %*% mm); names(libsize) <- colnames(mm)
+  ncell_d <- as.numeric(Matrix::colSums(mm));           names(ncell_d) <- colnames(mm)
+  nexpr   <- as.matrix(((cnts > 0) * 1) %*% mm)          # genes x donors: cells expressing
+
+  cpm <- sweep(pb_gene, 2, libsize, "/") * 1e6
+  pct <- sweep(nexpr,  2, ncell_d, "/") * 100
+  donor_grp <- md %>% dplyr::distinct(donor, grp) %>% tibble::deframe()
+
+  long <- as.data.frame(cpm) %>% rownames_to_column("gene") %>%
+    tidyr::pivot_longer(-gene, names_to = "donor", values_to = "cpm") %>%
+    dplyr::left_join(as.data.frame(pct) %>% rownames_to_column("gene") %>%
+                       tidyr::pivot_longer(-gene, names_to = "donor", values_to = "pct_expr"),
+                     by = c("gene","donor")) %>%
+    dplyr::left_join(as.data.frame(pb_gene) %>% rownames_to_column("gene") %>%
+                       tidyr::pivot_longer(-gene, names_to = "donor", values_to = "raw_counts"),
+                     by = c("gene","donor")) %>%
+    dplyr::mutate(grp = donor_grp[donor], n_cells = ncell_d[donor])
+
+  ## per-gene summary; group means use only donors with >= min_cells
+  summ <- long %>%
+    dplyr::group_by(gene) %>%
+    dplyr::summarise(
+      mean_cpm_MUT   = mean(cpm[grp == "MUTANT"           & n_cells >= min_cells]),
+      mean_cpm_HDint = mean(cpm[grp == "HEALTHY_internal" & n_cells >= min_cells]),
+      mean_cpm_HDext = mean(cpm[grp == "HEALTHY_external" & n_cells >= min_cells]),
+      n_mut_donors   = sum(grp == "MUTANT" & n_cells >= min_cells),
+      n_mut_expr     = sum(grp == "MUTANT" & n_cells >= min_cells & pct_expr >= expr_pct_cut),
+      top_donor_share= { r <- raw_counts[grp == "MUTANT"]; if (sum(r) > 0) max(r)/sum(r) else NA },
+      .groups = "drop") %>%
+    dplyr::mutate(
+      frac_mut_expr = ifelse(n_mut_donors > 0, n_mut_expr / n_mut_donors, NA),
+      one_donor     = !is.na(top_donor_share) & top_donor_share > 0.6 & n_mut_expr <= 2)
+
+  list(summary = summ, long = long)
+}
+
+## ---------- run curation for every compartment ----------
+all_curated <- list()
+for (cc in COMPARTMENTS) {
+  sig <- build_sig(cc, res_allctrl)
+  if (nrow(sig) == 0) { message(sprintf("[%s] no significant genes", cc)); next }
+
+  dd <- donor_diag(obj, cc, sig$gene)
+  summ <- if (!is.null(dd)) dd$summary else
+    data.frame(gene = sig$gene, mean_cpm_MUT = NA, mean_cpm_HDint = NA, mean_cpm_HDext = NA,
+               n_mut_donors = NA, n_mut_expr = NA, top_donor_share = NA,
+               frac_mut_expr = NA, one_donor = NA)
+
+  tab <- sig %>%
+    left_join(summ, by = "gene") %>%
+    mutate(
+      ## objective down-gene rule: keep DOWN iff external clearly > mutant
+      ratio_ext_mut = (mean_cpm_HDext + PSEUDO) / (mean_cpm_MUT + PSEUDO),
+      ratio_int_mut = (mean_cpm_HDint + PSEUDO) / (mean_cpm_MUT + PSEUDO),   # shown, not used in filter
+      keep_down = ifelse(direction == "DOWN_in_MUTANT",
+                         ratio_ext_mut >= DOWN_EXT_RATIO, NA),
+      ## final auto-keep: ALL up genes kept (you curate by hand); down genes gated by the rule
+      keep_auto = ifelse(direction == "UP_in_MUTANT", TRUE, keep_down)
+    ) %>%
+    arrange(direction, desc(abs(lfc_all)))
+
+  tagc <- gsub("[^A-Za-z0-9]+", "_", cc)
+  write.csv(tab, file.path(OUTDIR, sprintf("CURATE_%s.csv", tagc)), row.names = FALSE)
+  if (!is.null(dd)) write.csv(dd$long, file.path(OUTDIR, sprintf("CURATE_%s_perdonor_long.csv", tagc)),
+                              row.names = FALSE)
+  all_curated[[cc]] <- tab
+
+  n_up   <- sum(tab$direction == "UP_in_MUTANT")
+  n_dn   <- sum(tab$direction == "DOWN_in_MUTANT")
+  n_dnk  <- sum(tab$direction == "DOWN_in_MUTANT" & tab$keep_down, na.rm = TRUE)
+  cat(sprintf("\n===== %s : %d UP (all kept for manual review) | %d DOWN -> %d pass external rule =====\n",
+              cc, n_up, n_dn, n_dnk))
+  print(tab %>%
+          mutate(across(where(is.numeric), ~round(.x, 2))) %>%
+          select(gene, direction, lfc_all, padj_all,
+                 mean_cpm_MUT, mean_cpm_HDint, mean_cpm_HDext,
+                 frac_mut_expr, top_donor_share, one_donor,
+                 ratio_ext_mut, keep_down, keep_auto) %>%
+          as.data.frame(), row.names = FALSE)
+}
+
+all_curated_df <- bind_rows(all_curated)
+write.csv(all_curated_df, file.path(OUTDIR, "CURATE_ALL_compartments.csv"), row.names = FALSE)
+cat(sprintf("\nWrote CURATE_<compartment>.csv (+ _perdonor_long.csv) for %d compartments, plus CURATE_ALL_compartments.csv\n",
+            length(all_curated)))
+
+#remove mito/ribo/sex genes
+TECH <- list(
+  mito      = grepl("^MT-", all_curated_df$gene),
+  ribo      = grepl("^RP[SL]|^RPLP|^RPSA", all_curated_df$gene),
+  malat_neat= all_curated_df$gene %in% c("MALAT1","NEAT1"), #classic ambient/quality markers
+  sex       = all_curated_df$gene %in% c("XIST","RPS4Y1","DDX3Y","UTY","KDM5D",
+                "EIF1AY","USP9Y","ZFY","TXLNGY","NLGN4Y","TMSB4Y","PRKY","KDM6A")
+)
+hit <- Reduce(`|`, TECH)
+# among the genes you'd actually keep:
+all_curated_df[hit, c("gene","compartment","direction","lfc_all","padj_all")]
+```
+
+```{r HSC SRSF2 signature}
+## final HSC signature (manually curated from CURATE_HSCs.csv)
+## UP: IL1RAP, F13A1, PLD1, CNKSR2, PRKCD, HOMER3, CFD, COL4A5, ANKRD18B
+## DOWN: AVP, ALDH1A1, CDH7, TNFSF4, SH3BP5, ABI3BP
+
+## ============================================================
+## HSC SRSF2 signature — scoring, validation, publication plots
+## Assumes in memory: obj (with cohort / srsf2_status), all_curated_df
+## Produces: donor-level Wilcoxon, per-cell AUROC, final gene CSV
+## (figure panels: figure6_srsf2_hsc_signature_plots.Rmd)
+## ============================================================
+
+## ---------- config ----------
+COMP    <- "HSCs"
+UP      <- c("IL1RAP","F13A1","PLD1","CNKSR2","PRKCD","HOMER3","CFD","COL4A5","ANKRD18B")
+DOWN    <- c("AVP","ALDH1A1","CDH7","TNFSF4","SH3BP5","ABI3BP")
+CTCOL   <- "BoneMarrowMap_CellType_Broad_final"
+TAG     <- gsub("[^A-Za-z0-9]+", "_", COMP)
+
+## ---------- helpers ----------
+class2 <- function(cohort, status) dplyr::case_when(
+  cohort == "patient" & status == "mutated"            ~ "MUTANT",
+  cohort %in% c("healthy_internal","healthy_external") ~ "HEALTHY",
+  TRUE                                                 ~ NA_character_)
+
+## ---------- inspect final gene table ----------
+d <- all_curated_df %>%
+  filter(compartment == COMP, keep_auto) %>%
+  arrange(direction, desc(abs(lfc_all))) %>%
+  select(gene, direction, lfc_all, padj_all,
+         mean_cpm_MUT, mean_cpm_HDint, mean_cpm_HDext, frac_mut_expr)
+print(data.frame(lapply(d, function(x) if (is.numeric(x)) round(x, 2) else x)), row.names = FALSE)
+
+## ============================================================
+## 1. Score within compartment -> validation (donor Wilcoxon + per-cell AUROC)
+## ============================================================
+sub <- subset(obj, cells = colnames(obj)[which(obj@meta.data[[CTCOL]] == COMP)])
+sub <- AddModuleScore(sub, features = list(intersect(UP,   rownames(sub))), name = "UPm",   seed = 1)
+sub <- AddModuleScore(sub, features = list(intersect(DOWN, rownames(sub))), name = "DOWNm", seed = 1)
+sub$SIG_score <- sub$UPm1 - sub$DOWNm1
+sub$class     <- class2(sub$cohort, sub$srsf2_status)
+
+md <- sub@meta.data %>%
+  mutate(donor = as.character(orig.ident),
+         class = class2(cohort, srsf2_status)) %>%
+  filter(!is.na(class)) %>%
+  mutate(class  = factor(class, levels = c("MUTANT","HEALTHY")),
+         is_mut = as.integer(class == "MUTANT"))
+
+## donor means (unit the Wilcoxon tests + dots on the violin)
+donor_mean <- md %>%
+  group_by(donor, class) %>%
+  summarise(score = mean(SIG_score), n = n(), .groups = "drop") %>%
+  mutate(lab = donor)
+
+w <- wilcox.test(score ~ class, data = donor_mean)
+cat(sprintf("Donor Wilcoxon MUT(%d) vs HEALTHY(%d): p=%.5g\n",
+            sum(donor_mean$class=="MUTANT"), sum(donor_mean$class=="HEALTHY"), w$p.value))
+roc_obj <- pROC::roc(md$is_mut, md$SIG_score, quiet = TRUE, ci = TRUE)
+cat(sprintf("Per-cell AUROC = %.3f (%.3f-%.3f)\n",
+            as.numeric(roc_obj$auc), roc_obj$ci[1], roc_obj$ci[3]))
+
+## ============================================================
+## 2. Save final gene list
+## ============================================================
+write.csv(data.frame(gene = c(UP, DOWN),
+                     direction = rep(c("UP","DOWN"), c(length(UP), length(DOWN)))),
+          file.path(OUTDIR, sprintf("SIG_%s_final_genes.csv", TAG)), row.names = FALSE)
+cat(sprintf("Saved SIG_%s_final_genes.csv\n", TAG))
+```
