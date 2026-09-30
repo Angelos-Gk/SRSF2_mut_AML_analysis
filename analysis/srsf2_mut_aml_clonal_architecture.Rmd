@@ -1,5 +1,5 @@
 ---
-title: "Figure 4 - clonal architecture of the SRSF2-mutant cohort"
+title: "clonal architecture of the SRSF2-mutant cohort"
 output: html_document
 ---
 
