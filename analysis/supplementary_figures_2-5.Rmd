@@ -1,0 +1,578 @@
+---
+title: "Supplementary Figures 2-5"
+output: html_document
+---
+
+<!--
+  Supp. Fig. 2: benchmark (AML1010, AML1026) - on-target reads (Salmon) and barcode overlap between protocols
+  Supp. Fig. 3: % mutated progenitor cells vs blast count (SRSF2 cohort)
+  Supp. Fig. 4: differentiation pattern per evolutionary stage (P12, P13)
+  Supp. Fig. 5: pseudobulk DE per compartment, SRSF2-mutant vs all healthy controls
+  Run after figure6_srsf2_hsc_signature_analysis.Rmd (Supp. Fig. 5 reads its DE results).
+-->
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(stringr)
+  library(ggplot2)
+  library(ggpubr)
+  library(ggrepel)
+  library(patchwork)
+  library(UpSetR)
+  library(qs2)
+})
+
+## =========================================================
+## Paths
+## =========================================================
+PROJECT_DIR <- "/path/to/project"
+OBJ_DIR     <- file.path(PROJECT_DIR, "objects")
+QUANT_DIR   <- file.path(PROJECT_DIR, "salmon/quant_benchmark")       # <sample_id>/quant.sf
+REF_FA      <- file.path(PROJECT_DIR, "references/Homo_sapiens.GRCh38.cdna.all.fa.gz")
+DE_OUTDIR   <- file.path(PROJECT_DIR, "ext_DE_pseudo")                # output of figure6_srsf2_hsc_signature_analysis.Rmd
+
+OUTDIR_S2 <- file.path(PROJECT_DIR, "plots/supp_figure2")
+OUTDIR_S3 <- file.path(PROJECT_DIR, "plots/supp_figure3")
+OUTDIR_S4 <- file.path(PROJECT_DIR, "plots/supp_figure4")
+OUTDIR_S5 <- file.path(PROJECT_DIR, "plots/supp_figure5")
+for (d in c(OUTDIR_S2, OUTDIR_S3, OUTDIR_S4, OUTDIR_S5)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+## =========================================================
+## Inputs
+##   - benchmark mutation lists: preprocessing/nanoranger/extract_mutations_AML1010.R / _AML1026.R
+##   - obj:        preprocessing/scrna/07_bonemarrowmap_annotation.R
+##   - srsf2_nano: nanoranger calls of the SRSF2 cohort
+##   - DE results: figure6_srsf2_hsc_signature_analysis.Rmd (loaded in the Supp. Fig. 5 chunk)
+## =========================================================
+AML1010_benchmark <- readRDS(file.path(PROJECT_DIR, "AML1010/objects/AML1010_benchmark_mutation_data_list_inSeurat.rds"))
+AML1026_benchmark <- readRDS(file.path(PROJECT_DIR, "AML1026/objects/AML1026_benchmark_mutation_data_list_inSeurat.rds"))
+obj        <- qs2::qs_read(file.path(OBJ_DIR, "ext_obj_merge_filt_doublets_removed_norm_scaled_scvi_bonemarmap_passonly_finalanno.qs2"))
+srsf2_nano <- qs2::qs_read(file.path(OBJ_DIR, "srsf2_nano_combined_filtered.qs2"))
+
+## =========================================================
+## Shared settings
+## =========================================================
+CT_COL <- "BoneMarrowMap_CellType_Broad_final"
+
+## cell-type palette (same as Fig 3 / Fig 5)
+CT_PAL <- c(
+  "HSCs"                 = "#d24163",
+  "GMPs"                 = "#4d8445",
+  "Lymphoid progenitors" = "#3e2664",
+  "MEPs"                 = "darkorange",
+  "Erythroid-like cells" = "#bd7533",
+  "Monocytes"            = "#5bb94d",
+  "T-cells"              = "#8DA0CB",
+  "B-cells"              = "#A6761D",
+  "NK cells"             = "#c959ad",
+  "Dendritic cells"      = "#a1af47",
+  "Plasma cells"         = "brown",
+  "Stromal cells"        = "#A6CEE3"
+)
+
+## --- Supp. Fig. 2: benchmark protocols + panel genes ---
+PROTOCOL_ORDER <- c("rhPCR", "taqman_biotin", "taqman")
+PROTOCOL_COLORS <- c(
+  rhPCR         = "#0072B2",
+  taqman_biotin = "#009E73",
+  taqman        = "#E69F00"
+)
+COVERAGE_MIN <- 1
+
+panel_genes_1010 <- c("NRAS","RNPEPL1","C4orf33","CYFIP2","E2F3","MCM7",
+                      "BMPR1A","ACIN1","TCF12","ZNF407","RALY","THAP7","SPNS1")
+panel_genes_1026 <- c("GNB1","NRAS","LPGAT1","SF3B1","CCDC88B",
+                      "MARS1","SRSF2","CSNK1D","PNKP")
+
+## --- Supp. Fig. 3: progenitors + blast counts ---
+PROGENITORS  <- c("HSCs", "GMPs", "MEPs", "Lymphoid progenitors")
+MIN_CELLS_S3 <- 10
+
+## bone marrow blast count at sampling (same as Fig 3)
+blast_df <- data.frame(
+  patient   = c("P1","P2","P3","P4","P5","P6","P7","P8","P9","P10","P11","P12","P16"),
+  blast_pct = c(50, 30, 80, 70, 40, 80, 25, 70, 40, 95, 90, 14, 20)
+)
+
+## --- Supp. Fig. 4: subclone loci ---
+PT_COL       <- "sample"
+MIN_CELLS_S4 <- 15          # bars below this get a "*" after n
+
+## gene names as they appear in srsf2_nano$gene
+G_KLHL15 <- "KLHL15"
+G_SRSF2  <- "SRSF2"
+G_STAG2  <- "STAG2"
+G_PTPN11 <- "PTPN11"
+G_IDH1   <- "IDH1"
+
+## --- Supp. Fig. 5: DE thresholds + excluded sex-linked genes ---
+PADJ_THRESH <- 0.05
+LFC_THRESH  <- 1
+
+sex_genes <- c(
+  "XIST", "TSIX",
+  "RPS4Y1", "RPS4Y2", "DDX3Y", "KDM5D", "UTY", "EIF1AY",
+  "USP9Y", "ZFY", "TXLNGY", "TMSB4Y", "PRKY", "NLGN4Y",
+  "SRY", "AMELY", "TBL1Y", "PCDH11Y"
+)
+```
+
+```{r S2 percentage of library mapping to individual targets versus off-targets (salmon)}
+# ============================================================
+# On-target vs off-target reads (Salmon/minimap2) per protocol
+# AML1010.1 and AML1026.1 across 3 protocols
+# ============================================================
+
+# -------------------------
+# Transcript -> gene symbol map from the reference FASTA headers
+# -------------------------
+headers <- system(paste0("zcat ", REF_FA, " | grep '^>'"), intern = TRUE)
+
+tx2gene <- data.frame(
+  transcript_id = stringr::str_extract(headers, "(?<=>)ENST[0-9]+\\.[0-9]+"),
+  gene_symbol   = stringr::str_extract(headers, "(?<=gene_symbol:)\\S+")
+) %>%
+  dplyr::filter(!is.na(transcript_id), !is.na(gene_symbol))
+
+# -------------------------
+# Read quant.sf, annotate, summarise
+# -------------------------
+read_and_summarise <- function(sample_id, panel_genes, patient, protocol) {
+  read.table(file.path(QUANT_DIR, sample_id, "quant.sf"), header = TRUE, sep = "\t") %>%
+    dplyr::rename(transcript_id = Name) %>%
+    dplyr::left_join(tx2gene, by = "transcript_id") %>%
+    dplyr::mutate(
+      gene_symbol = dplyr::coalesce(gene_symbol, "Unknown"),
+      category    = dplyr::if_else(gene_symbol %in% panel_genes, gene_symbol, "Off-target")
+    ) %>%
+    dplyr::group_by(category) %>%
+    dplyr::summarise(total_reads = sum(NumReads), .groups = "drop") %>%
+    dplyr::mutate(
+      pct      = 100 * total_reads / sum(total_reads),
+      patient  = patient,
+      protocol = protocol
+    )
+}
+
+all_df <- dplyr::bind_rows(
+  read_and_summarise("AML1010.1_rhPCR",         panel_genes_1010, "AML1010", "rhPCR"),
+  read_and_summarise("AML1010.1_taqman",        panel_genes_1010, "AML1010", "taqman"),
+  read_and_summarise("AML1010.1_taqman_biotin", panel_genes_1010, "AML1010", "taqman_biotin"),
+  read_and_summarise("AML1026.1_rhPCR",         panel_genes_1026, "AML1026", "rhPCR"),
+  read_and_summarise("AML1026.1_taqman",        panel_genes_1026, "AML1026", "taqman"),
+  read_and_summarise("AML1026.1_taqman_biotin", panel_genes_1026, "AML1026", "taqman_biotin")
+) %>%
+  dplyr::mutate(protocol = factor(protocol, levels = PROTOCOL_ORDER))
+
+print(all_df %>% dplyr::arrange(patient, protocol, dplyr::desc(pct)))
+
+# -------------------------
+# Order categories by rhPCR pct, Off-target always last
+# -------------------------
+get_order <- function(df, pid) {
+  df %>%
+    dplyr::filter(patient == pid, protocol == "rhPCR") %>%
+    dplyr::arrange(dplyr::desc(pct)) %>%
+    dplyr::pull(category) %>%
+    { c(setdiff(., "Off-target"), "Off-target") }
+}
+
+# -------------------------
+# Plot — facets by protocol, bars by target
+# -------------------------
+make_plot <- function(df, pid, cat_order, is_first = TRUE) {
+  df %>%
+    dplyr::filter(patient == pid) %>%
+    dplyr::mutate(category = factor(category, levels = cat_order)) %>%
+    ggplot2::ggplot(ggplot2::aes(x = category, y = pct, fill = protocol)) +
+    ggplot2::geom_col(color = "black", linewidth = 0.2, width = 0.75) +
+    ggplot2::geom_text(ggplot2::aes(label = paste0(round(pct, 1), "%")),
+                       vjust = -0.4, size = 1.8, color = "black") +
+    ggplot2::facet_wrap(~ protocol, ncol = 3) +
+    ggplot2::scale_fill_manual(values = PROTOCOL_COLORS, guide = "none") +
+    ggplot2::scale_y_continuous(
+      name   = if (is_first) "% of mapped reads" else NULL,
+      expand = ggplot2::expansion(mult = c(0, 0.12)),
+      labels = function(x) paste0(x, "%")
+    ) +
+    ggplot2::scale_x_discrete(name = NULL) +
+    ggplot2::ggtitle(pid) +
+    ggplot2::theme_classic(base_size = 7) +
+    ggplot2::theme(
+      strip.background = ggplot2::element_blank(),
+      strip.text       = ggplot2::element_text(face = "bold", size = 7),
+      axis.text.x      = ggplot2::element_text(angle = 45, hjust = 1, size = 6),
+      axis.text.y      = ggplot2::element_text(size = 6),
+      axis.line        = ggplot2::element_line(linewidth = 0.3),
+      axis.ticks       = ggplot2::element_line(linewidth = 0.3),
+      legend.position  = "none",
+      plot.title       = ggplot2::element_text(face = "bold", hjust = 0.5, size = 8),
+      plot.margin      = ggplot2::margin(2, 2, 2, 2, "mm")
+    )
+}
+
+# -------------------------
+# Save with widths proportional to the number of targets
+# -------------------------
+bar_width_cm <- 0.8
+base_margin  <- 4
+
+for (pid in c("AML1010", "AML1026")) {
+  cat_order <- get_order(all_df, pid)
+  p <- make_plot(all_df, pid, cat_order, is_first = (pid == "AML1010"))
+  w <- length(PROTOCOL_ORDER) * (length(cat_order) * bar_width_cm + base_margin)
+
+  ggplot2::ggsave(file.path(OUTDIR_S2, paste0("salmon_benchmark_pertarget_", pid, ".pdf")),
+                  p, width = w, height = 8, units = "cm", useDingbats = FALSE)
+  ggplot2::ggsave(file.path(OUTDIR_S2, paste0("salmon_benchmark_pertarget_", pid, ".png")),
+                  p, width = w, height = 8, units = "cm", dpi = 300)
+}
+```
+
+```{r S2 overlap of barcodes captured between conditions}
+# ============================================================
+# Barcode overlap between protocols (UpSet)
+# ============================================================
+for (pid in c("AML1010", "AML1026")) {
+  bench <- if (pid == "AML1010") AML1010_benchmark else AML1026_benchmark
+
+  bc_by_protocol <- purrr::imap_dfr(bench, ~ dplyr::mutate(.x, gene = .y)) %>%
+    dplyr::filter(as.integer(alt) + as.integer(ref) >= COVERAGE_MIN) %>%
+    dplyr::distinct(protocol, bc) %>%
+    dplyr::filter(protocol %in% PROTOCOL_ORDER)
+
+  bc_list <- list(
+    rhPCR         = bc_by_protocol$bc[bc_by_protocol$protocol == "rhPCR"],
+    taqman        = bc_by_protocol$bc[bc_by_protocol$protocol == "taqman"],
+    taqman_biotin = bc_by_protocol$bc[bc_by_protocol$protocol == "taqman_biotin"]
+  )
+
+  pdf(file.path(OUTDIR_S2, paste0("barcode_overlap_upset_", pid, ".pdf")),
+      width = 8/2.54, height = 8/2.54, onefile = FALSE)
+  print(UpSetR::upset(
+    UpSetR::fromList(bc_list),
+    order.by       = "freq",
+    sets           = c("taqman", "taqman_biotin", "rhPCR"),  # bottom to top
+    keep.order     = TRUE,
+    text.scale     = 1.2,
+    main.bar.color = "black",
+    sets.bar.color = unname(PROTOCOL_COLORS[c("taqman", "taqman_biotin", "rhPCR")])
+  ))
+  dev.off()
+}
+```
+
+```{r S3 correlation between percentage of mutated progenitor cells and the blast count}
+# -------------------------
+# % mutated cells per patient and cell type
+# -------------------------
+nano_by_cell <- srsf2_nano %>%
+  dplyr::filter(!is.na(bc),
+                mutated %in% c("mutated", "wildtype"),
+                in_seurat == TRUE) %>%
+  dplyr::mutate(bc = as.character(bc), sample_name = as.character(sample_name)) %>%
+  dplyr::group_by(sample_name, bc) %>%
+  dplyr::summarise(mutated_any = any(mutated == "mutated"), .groups = "drop")
+
+meta_df <- obj@meta.data %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::mutate(cell       = as.character(cell),
+                orig.ident = as.character(orig.ident),
+                celltype   = as.character(.data[[CT_COL]])) %>%
+  dplyr::select(cell, orig.ident, celltype)
+
+joined <- meta_df %>%
+  dplyr::inner_join(nano_by_cell, by = c("cell" = "bc", "orig.ident" = "sample_name")) %>%
+  dplyr::mutate(patient = orig.ident) %>%
+  dplyr::filter(!is.na(celltype), grepl("^P", patient))       # patients only
+
+pct_df <- joined %>%
+  dplyr::group_by(patient, celltype) %>%
+  dplyr::summarise(
+    total_genotyped = dplyr::n_distinct(cell),
+    mutated_cells   = dplyr::n_distinct(cell[mutated_any]),
+    pct_mutated     = 100 * mutated_cells / total_genotyped,
+    .groups         = "drop"
+  ) %>%
+  dplyr::filter(is.finite(pct_mutated), total_genotyped >= MIN_CELLS_S3)
+
+# -------------------------
+# Per-progenitor values + mean across progenitors per patient
+# -------------------------
+corr_df_all <- dplyr::bind_rows(
+  pct_df %>%
+    dplyr::filter(celltype %in% PROGENITORS) %>%
+    dplyr::select(patient, celltype, pct_mutated),
+  pct_df %>%
+    dplyr::filter(celltype %in% PROGENITORS) %>%
+    dplyr::group_by(patient) %>%
+    dplyr::summarise(pct_mutated = mean(pct_mutated, na.rm = TRUE),
+                     celltype    = "All progenitors", .groups = "drop")
+) %>%
+  dplyr::inner_join(blast_df, by = "patient")
+
+# -------------------------
+# Plot function
+# -------------------------
+make_corr_plot <- function(df, ct, is_first = FALSE) {
+  df_ct <- df %>% dplyr::filter(celltype == ct)
+
+  ggplot2::ggplot(df_ct, ggplot2::aes(x = blast_pct, y = pct_mutated)) +
+    ggplot2::geom_smooth(method = "lm", se = TRUE, color = "black",
+                         linewidth = 0.4, fill = "grey80") +
+    ggplot2::geom_point(shape = 21, fill = "#d24163", color = "black",
+                        size = 2, stroke = 0.3) +
+    ggrepel::geom_text_repel(
+      ggplot2::aes(label = patient),
+      size = 2, color = "black", min.segment.length = 0,
+      segment.size = 0.3, box.padding = 0.3, max.overlaps = Inf
+    ) +
+    ggpubr::stat_cor(method = "pearson", label.x = 5, label.y = 105, size = 2.5) +
+    ggplot2::scale_x_continuous(name = "Blast count (%)",
+                                limits = c(0, 100), breaks = seq(0, 100, 25)) +
+    ggplot2::scale_y_continuous(name = if (is_first) "% mutated cells" else NULL,
+                                limits = c(0, 112), breaks = seq(0, 100, 25)) +
+    ggplot2::ggtitle(ct) +
+    ggplot2::theme_classic(base_size = 7) +
+    ggplot2::theme(
+      plot.title  = ggplot2::element_text(face = "bold", hjust = 0.5, size = 7),
+      axis.text   = ggplot2::element_text(size = 6),
+      axis.title  = ggplot2::element_text(size = 7),
+      axis.line   = ggplot2::element_line(linewidth = 0.3),
+      axis.ticks  = ggplot2::element_line(linewidth = 0.3),
+      plot.margin = ggplot2::margin(2, 2, 2, 2, "mm")
+    )
+}
+
+# -------------------------
+# Per-progenitor plot (4 panels)
+# -------------------------
+p_per <- patchwork::wrap_plots(
+  purrr::imap(PROGENITORS, ~ make_corr_plot(corr_df_all, .x, is_first = (.y == 1))),
+  ncol = 4
+)
+
+ggplot2::ggsave(file.path(OUTDIR_S3, "progenitor_pct_mutated_vs_blast_correlation_per_type.pdf"),
+                p_per, width = 18, height = 6, units = "cm", useDingbats = FALSE)
+ggplot2::ggsave(file.path(OUTDIR_S3, "progenitor_pct_mutated_vs_blast_correlation_per_type.png"),
+                p_per, width = 18, height = 6, units = "cm", dpi = 300)
+
+# -------------------------
+# Aggregate plot (1 panel)
+# -------------------------
+p_agg <- make_corr_plot(corr_df_all, "All progenitors", is_first = TRUE)
+
+ggplot2::ggsave(file.path(OUTDIR_S3, "progenitor_pct_mutated_vs_blast_correlation_aggregate.pdf"),
+                p_agg, width = 6, height = 6, units = "cm", useDingbats = FALSE)
+ggplot2::ggsave(file.path(OUTDIR_S3, "progenitor_pct_mutated_vs_blast_correlation_aggregate.png"),
+                p_agg, width = 6, height = 6, units = "cm", dpi = 300)
+```
+
+```{r S4 subclone differentiation per evolutionary stage}
+## ═══════════════════════════════════════════════════════════════════════
+##  Differentiation pattern per evolutionary stage
+##  2x2 grid per patient, one stacked bar per panel:
+##   P12: row1 KLHL15mut+SRSF2wt | KLHL15mut+SRSF2mut
+##        row2 SRSF2mut+STAG2wt  | SRSF2mut+STAG2mut
+##   P13: row1 SRSF2mut+PTPN11wt | SRSF2mut+PTPN11mut
+##        row2 SRSF2mut+IDH1wt   | SRSF2mut+IDH1mut
+##  Each bar = cells genotyped at BOTH loci with the stated calls.
+## ═══════════════════════════════════════════════════════════════════════
+
+## ── genotypes: one call per (patient, cell, gene) ────────────────────────
+geno <- srsf2_nano %>%
+  dplyr::mutate(patient = as.character(sample_name)) %>%
+  dplyr::filter(!grepl("^HD", patient), alt + ref > 0,
+                mutated %in% c("mutated","wildtype")) %>%
+  dplyr::group_by(patient, bc, gene) %>%
+  dplyr::summarise(call = if (any(mutated == "mutated")) "mutated" else "wildtype",
+                   .groups = "drop")
+
+## ── cell type per cell ───────────────────────────────────────────────────
+meta <- data.frame(bc       = rownames(obj@meta.data),
+                   patient  = as.character(obj@meta.data[[PT_COL]]),
+                   celltype = as.character(obj@meta.data[[CT_COL]]),
+                   row.names = NULL, stringsAsFactors = FALSE)
+
+## ── bar definitions (order = top-left, top-right, bottom-left, bottom-right) ──
+bar <- function(g1, c1, g2, c2) {
+  calls <- c(mut = "mutated", wt = "wildtype")
+  list(id    = paste0(g1, c1, "_", g2, c2),
+       label = sprintf("italic(%s)^%s~italic(%s)^%s", g1, c1, g2, c2),
+       req   = setNames(unname(calls[c(c1, c2)]), c(g1, g2)))
+}
+
+CLONES <- list(
+  P12 = list(
+    bar(G_KLHL15, "mut", G_SRSF2, "wt"),
+    bar(G_KLHL15, "mut", G_SRSF2, "mut"),
+    bar(G_SRSF2,  "mut", G_STAG2, "wt"),
+    bar(G_SRSF2,  "mut", G_STAG2, "mut")
+  ),
+  P13 = list(
+    bar(G_SRSF2, "mut", G_PTPN11, "wt"),
+    bar(G_SRSF2, "mut", G_PTPN11, "mut"),
+    bar(G_SRSF2, "mut", G_IDH1,   "wt"),
+    bar(G_SRSF2, "mut", G_IDH1,   "mut")
+  )
+)
+
+## ── cells per bar ────────────────────────────────────────────────────────
+bar_cells <- function(pt, s) {
+  genes <- names(s$req)
+  avail <- unique(geno$gene[geno$patient == pt])
+  miss  <- setdiff(genes, avail)
+  if (length(miss))
+    stop(sprintf("%s: loci not found: %s\n  available: %s", pt,
+                 paste(miss, collapse = ", "), paste(sort(avail), collapse = ", ")))
+  W <- geno %>% dplyr::filter(patient == pt, gene %in% genes) %>%
+    tidyr::pivot_wider(id_cols = bc, names_from = gene, values_from = call)
+  ok <- rep(TRUE, nrow(W))
+  for (g in genes) ok <- ok & (W[[g]] %in% s$req[[g]])
+  meta %>% dplyr::filter(patient == pt, !is.na(celltype), bc %in% W$bc[ok]) %>%
+    dplyr::mutate(clone = s$id)
+}
+
+## ── single-bar panel ─────────────────────────────────────────────────────
+plot_one_bar <- function(cells, s, present, show_y) {
+  d <- cells %>% dplyr::filter(clone == s$id)
+  n <- nrow(d)
+  comp <- d %>% dplyr::count(clone, celltype) %>%
+    dplyr::mutate(frac = n / sum(n),
+                  celltype = factor(celltype, levels = names(CT_PAL)))
+  ggplot2::ggplot(comp, ggplot2::aes(clone, frac, fill = celltype)) +
+    ggplot2::geom_col(width = .6, colour = "white", linewidth = .15) +
+    ggplot2::annotate("text", x = 1, y = 1.015, vjust = 0, size = 2.2, colour = "grey25",
+                      label = paste0("n=", n, ifelse(n < MIN_CELLS_S4, "*", ""))) +
+    ggplot2::scale_fill_manual(values = CT_PAL, limits = present, breaks = present,
+                               drop = FALSE, name = "cell type") +
+    ggplot2::scale_x_discrete(labels = NULL) +
+    ggplot2::scale_y_continuous(limits = c(0, 1.08), breaks = seq(0, 1, .25),
+                                expand = c(0, 0)) +
+    ggplot2::labs(x = NULL, y = if (show_y) "fraction of cells" else NULL,
+                  title = parse(text = s$label)[[1]]) +
+    ggplot2::theme_classic(base_size = 7) +
+    ggplot2::theme(plot.title      = ggplot2::element_text(size = 7, hjust = .5),
+                   axis.ticks.x    = ggplot2::element_blank(),
+                   legend.key.size = ggplot2::unit(7, "pt"),
+                   legend.text     = ggplot2::element_text(size = 6))
+}
+
+## ── one 2x2 figure per patient ───────────────────────────────────────────
+plots <- purrr::imap(CLONES, function(specs, pt) {
+  cells   <- purrr::map_dfr(specs, ~ bar_cells(pt, .x))
+  present <- names(CT_PAL)[names(CT_PAL) %in% cells$celltype]
+  panels  <- purrr::imap(specs, ~ plot_one_bar(cells, .x, present, show_y = .y %% 2 == 1))
+  p <- patchwork::wrap_plots(panels, ncol = 2, guides = "collect") +
+    patchwork::plot_annotation(title = pt,
+      theme = ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 8)))
+  f <- file.path(OUTDIR_S4, sprintf("suppfig4_%s_clone_differentiation", pt))
+  ggplot2::ggsave(paste0(f, ".pdf"), p, width = 10, height = 12, units = "cm")
+  ggplot2::ggsave(paste0(f, ".png"), p, width = 10, height = 12, units = "cm", dpi = 300)
+  p
+})
+```
+
+```{r S5 volcano per compartment}
+# ============================================================
+# DE results (figure6_srsf2_hsc_signature_analysis.Rmd)
+# ============================================================
+res_allctrl <- read.csv(file.path(DE_OUTDIR, "DE_vs_all_controls_all_compartments.csv"),
+                        stringsAsFactors = FALSE) %>%
+  dplyr::filter(!gene %in% sex_genes)
+
+# --- global axis limits across ALL compartments (comparable panels, symmetric x-axis) ---
+d_all <- res_allctrl %>% dplyr::filter(comparison == "vs_all_controls", !is.na(padj))
+x_lim <- max(abs(d_all$log2FoldChange), na.rm = TRUE) * 1.05
+y_lim <- max(-log10(d_all$padj), na.rm = TRUE) * 1.05
+
+x_breaks <- sort(unique(c(seq(-floor(x_lim), floor(x_lim), by = 2), -LFC_THRESH, LFC_THRESH, 0)))
+y_breaks <- sort(unique(c(pretty(c(0, y_lim)), round(-log10(PADJ_THRESH), 2))))
+
+# ============================================================
+# Volcano panel builder (one compartment at a time)
+# ============================================================
+volcano_panel <- function(res, comp, tag, top_n = 15) {
+  d <- res %>% dplyr::filter(compartment == comp, comparison == tag, !is.na(padj))
+  if (!nrow(d)) return(NULL)
+
+  d$sig <- dplyr::case_when(
+    d$padj < PADJ_THRESH & d$log2FoldChange >  LFC_THRESH ~ "up_mutant",
+    d$padj < PADJ_THRESH & d$log2FoldChange < -LFC_THRESH ~ "up_healthy",
+    TRUE                                                  ~ "ns"
+  )
+  n_up   <- sum(d$sig == "up_mutant")
+  n_down <- sum(d$sig == "up_healthy")
+
+  top_genes <- d %>%
+    dplyr::filter(sig != "ns") %>%
+    dplyr::arrange(padj) %>%
+    dplyr::slice_head(n = top_n) %>%
+    dplyr::pull(gene)
+  d$label <- ifelse(d$gene %in% top_genes, d$gene, "")
+
+  # ns points first (background), significant points on top
+  d <- d %>% dplyr::arrange(sig == "ns")
+
+  ggplot(d, aes(log2FoldChange, -log10(padj), color = sig, size = sig, alpha = sig)) +
+    geom_point() +
+    scale_color_manual(
+      values = c(ns = "grey75", up_mutant = "#d24163", up_healthy = "#3B7FB6"),
+      labels = c(ns = "NS", up_mutant = "Up in MUTANT", up_healthy = "Up in HEALTHY"),
+      name   = NULL
+    ) +
+    scale_size_manual(values = c(ns = 0.35, up_mutant = 0.8, up_healthy = 0.8), guide = "none") +
+    scale_alpha_manual(values = c(ns = 0.35, up_mutant = 0.85, up_healthy = 0.85), guide = "none") +
+    geom_vline(xintercept = c(-LFC_THRESH, LFC_THRESH), linetype = 2, color = "grey85", linewidth = 0.3) +
+    geom_hline(yintercept = -log10(PADJ_THRESH), linetype = 2, color = "grey85", linewidth = 0.3) +
+    ggrepel::geom_text_repel(
+      aes(label = label), size = 1.8, color = "black",
+      max.overlaps = Inf, min.segment.length = 0,
+      segment.size = 0.2, box.padding = 0.25, seed = 1,
+      show.legend = FALSE
+    ) +
+    scale_x_continuous(limits = c(-x_lim, x_lim), breaks = x_breaks) +
+    scale_y_continuous(limits = c(0, y_lim), breaks = y_breaks) +
+    labs(
+      title = sprintf("%s (%d up / %d down)", comp, n_up, n_down),
+      x     = "log2 FC (MUTANT / HEALTHY)",
+      y     = "-log10 padj"
+    ) +
+    theme_classic(base_size = 8) +
+    theme(
+      plot.title = element_text(size = 7.5, face = "bold", hjust = 0.5),
+      axis.title = element_text(size = 7),
+      axis.text  = element_text(size = 6, color = "black")
+    )
+}
+
+# ============================================================
+# One panel per compartment, combined into a single figure
+# ============================================================
+compartments_tested <- unique(res_allctrl$compartment)
+
+volcano_plots <- lapply(compartments_tested, function(cc) volcano_panel(res_allctrl, cc, "vs_all_controls"))
+names(volcano_plots) <- compartments_tested
+volcano_plots <- Filter(Negate(is.null), volcano_plots)
+
+n_col <- ceiling(sqrt(length(volcano_plots)))
+n_row <- ceiling(length(volcano_plots) / n_col)
+
+combined_volcano <- patchwork::wrap_plots(volcano_plots, ncol = n_col, nrow = n_row) +
+  patchwork::plot_layout(guides = "collect") &
+  ggplot2::theme(
+    legend.position = "bottom",
+    legend.text     = ggplot2::element_text(size = 7),
+    legend.key.size = ggplot2::unit(0.35, "cm")
+  ) &
+  ggplot2::guides(color = ggplot2::guide_legend(override.aes = list(size = 2, alpha = 1)))
+
+ggsave(file.path(OUTDIR_S5, "volcano_all_compartments_vs_all_controls.pdf"),
+       combined_volcano, width = n_col * 6, height = n_row * 5 + 1.5, units = "cm", useDingbats = FALSE)
+ggsave(file.path(OUTDIR_S5, "volcano_all_compartments_vs_all_controls.png"),
+       combined_volcano, width = n_col * 6, height = n_row * 5 + 1.5, units = "cm", dpi = 300, bg = "white")
+```
