@@ -1,5 +1,5 @@
 ---
-title: "Figure 6 (plots) - SRSF2-mutant vs healthy: HSC signature"
+title: "SRSF2-mutant vs healthy: HSC signature plots"
 output: html_document
 ---
 
