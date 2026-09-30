@@ -1,0 +1,771 @@
+---
+title: "Figure 5 - SRSF2 subclones: localization, composition and expression"
+output: html_document
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(readr)
+  library(forcats)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(cowplot)
+  library(qs2)
+})
+
+## =========================================================
+## Paths
+## =========================================================
+PROJECT_DIR <- "/path/to/project"
+OBJ_DIR     <- file.path(PROJECT_DIR, "objects")
+OUTDIR_SC   <- file.path(PROJECT_DIR, "plots/figure5")     # subclone localization figures + tables
+OUTDIR_DE   <- file.path(OUTDIR_SC, "de")                  # subclone vs founding DE + GSEA
+dir.create(OUTDIR_DE, recursive = TRUE, showWarnings = FALSE)
+
+## =========================================================
+## Inputs
+##   - obj:        preprocessing/scrna/07_bonemarrowmap_annotation.R
+##   - srsf2_nano: nanoranger calls of the SRSF2 cohort
+## =========================================================
+obj        <- qs2::qs_read(file.path(OBJ_DIR, "ext_obj_merge_filt_doublets_removed_norm_scaled_scvi_bonemarmap_passonly_finalanno.qs2"))
+srsf2_nano <- qs2::qs_read(file.path(OBJ_DIR, "srsf2_nano_combined_filtered.qs2"))
+
+## =========================================================
+## Shared settings
+## =========================================================
+PT_COL   <- "sample"
+RED_NAME <- "umap_projected"                          # BMM-projected embedding (matches Fig 3C)
+CT_COL   <- "BoneMarrowMap_CellType_Broad_final"
+FOUND    <- "#2166AC"; SUB <- "#B2182B"               # founding blue / subclone red
+
+## cell-type palette (same as Fig 3)
+CT_PAL <- c(
+  "HSCs"                 = "#d24163",
+  "GMPs"                 = "#4d8445",
+  "Lymphoid progenitors" = "#3e2664",
+  "MEPs"                 = "darkorange",
+  "Erythroid-like cells" = "#bd7533",
+  "Monocytes"            = "#5bb94d",
+  "T-cells"              = "#8DA0CB",
+  "B-cells"              = "#A6761D",
+  "NK cells"             = "#c959ad",
+  "Dendritic cells"      = "#a1af47",
+  "Plasma cells"         = "brown",
+  "Stromal cells"        = "#A6CEE3"
+)
+
+## =========================================================
+## Per-cell genotypes (informative calls: alt + ref > 0) and per-cell UMAP / cell type
+## =========================================================
+geno <- srsf2_nano %>%
+  dplyr::mutate(patient = as.character(sample_name)) %>%
+  dplyr::filter(!grepl("^HD", patient), alt + ref > 0,
+                mutated %in% c("mutated","wildtype")) %>%
+  dplyr::distinct(patient, bc, gene, mutated)
+
+E   <- Embeddings(obj, RED_NAME)[,1:2]
+emb <- data.frame(bc = rownames(E), UMAP1 = E[,1], UMAP2 = E[,2],
+                  patient  = as.character(obj@meta.data[[PT_COL]]),
+                  celltype = as.character(obj@meta.data[[CT_COL]]),
+                  row.names = NULL, stringsAsFactors = FALSE)
+ct_of <- setNames(emb$celltype, emb$bc)               # barcode -> cell type
+
+## SRSF2-mutant cells split into founding clone (SRSF2+ / target-wt) and subclone (SRSF2+ / target+)
+subclone_cells <- function(pt, g) {
+  t <- geno %>% dplyr::filter(patient==pt, gene==g)       %>% dplyr::distinct(bc, t=mutated)
+  s <- geno %>% dplyr::filter(patient==pt, gene=="SRSF2") %>% dplyr::distinct(bc, s=mutated)
+  j <- dplyr::inner_join(t, s, by="bc")
+  js <- dplyr::filter(j, s=="mutated")                 # SRSF2+ only
+  list(found = js$bc[js$t=="wildtype"],                # SRSF2+ / target-wt
+       sub   = js$bc[js$t=="mutated"],                 # SRSF2+ / target+
+       n_both_genotyped = nrow(j))
+}
+```
+
+```{r subclone localization (founding vs subclone)}
+## ═══════════════════════════════════════════════════════════════════════
+##  SUBCLONE LOCALIZATION (single-cell, SRSF2-mutant compartment)
+##  Q: within SRSF2+ cells, does the SRSF2+ / target+ SUBCLONE sit elsewhere
+##     on the UMAP than the SRSF2+ / target-wt FOUNDING clone?
+##  No ordering test — order is known from Fig 2. BoneMarrowMap plotting style:
+##  all sample cells lightgrey, cells-in-question highlighted on top.
+##  Uses: geno, emb, CT_PAL, subclone_cells (setup chunk)
+## ═══════════════════════════════════════════════════════════════════════
+## ── CONFIG ─────────────────────────────────────────────────────────────
+MIN_INF  <- 20      # min cells genotyped for a locus
+MIN_BOTH <- 40      # min cells genotyped for BOTH loci
+MIN_CLONE<- 15      # min cells in EACH group (founding & subclone) to draw
+GREY_BG <- "grey88"                                   # backdrop colour (all sample cells)
+PRIMITIVE <- c("HSCs","GMPs","MEPs","Lymphoid progenitors")
+
+## ── candidate co-drivers (>= MIN_INF informative cells, co-genotyped with SRSF2) ──
+gene_n <- geno %>% dplyr::count(patient, gene, name="n_inf") %>% dplyr::filter(n_inf>=MIN_INF)
+codrivers <- gene_n %>% dplyr::filter(gene!="SRSF2") %>%
+  dplyr::semi_join(dplyr::filter(gene_n, gene=="SRSF2"), by="patient")
+
+## ═══════════════════════════════════════════════════════════════════════
+##  HIGHLIGHT-ON-GREY helper (BoneMarrowMap style) — used by all UMAPs.
+##  backdrop = ALL cells of the patient (lightgrey, drawn first, small);
+##  cells-in-question layered ON TOP, larger.
+##    mode "celltype" -> highlight coloured by cell type (BMM rows)
+##    mode "twocol"   -> highlight coloured by founding/subclone group (overlay)
+## ═══════════════════════════════════════════════════════════════════════
+hi_coords <- function(pt, bcs) emb %>% dplyr::filter(patient == pt, bc %in% bcs)
+
+hl_umap <- function(pt, hi_df, title, subtitle,
+                    mode = c("celltype","twocol"), pal = CT_PAL) {
+  mode <- match.arg(mode)
+  base <- emb %>% dplyr::filter(patient == pt)                 # ALL sample cells
+  p <- ggplot() +
+    geom_point(data = base, aes(UMAP1, UMAP2),
+               colour = GREY_BG, size = 0.2, stroke = 0)       # lightgrey backdrop
+  if (mode == "celltype") {
+    p <- p + geom_point(data = hi_df, aes(UMAP1, UMAP2, colour = celltype),
+                        size = 0.7, stroke = 0) +
+      scale_colour_manual(values = pal, drop = FALSE, name = "cell type")
+  } else {
+    p <- p + geom_point(data = hi_df, aes(UMAP1, UMAP2, colour = group),
+                        size = 0.8, stroke = 0) +
+      scale_colour_manual(values = pal, name = NULL) +
+      guides(colour = guide_legend(override.aes = list(size = 2.2)))
+  }
+  p + coord_equal() +
+    labs(title = title, subtitle = subtitle, x = NULL, y = NULL) +
+    theme_void(base_size = 8) +
+    theme(plot.title = element_text(face = "bold", size = 8, hjust = .5),
+          plot.subtitle = element_text(size = 6.5, colour = "grey30", hjust = .5),
+          legend.position = "none")
+}
+
+## ── overlay UMAP: founding (blue) vs subclone (red) on grey ─────────────
+overlay_umap <- function(pt, g) {
+  cc <- subclone_cells(pt, g)
+  if (length(cc$found) < MIN_CLONE || length(cc$sub) < MIN_CLONE) return(NULL)
+  hi <- dplyr::bind_rows(
+    hi_coords(pt, cc$found) %>% dplyr::mutate(group = "SRSF2+ / target-wt (founding)"),
+    hi_coords(pt, cc$sub)   %>% dplyr::mutate(group = "SRSF2+ / target+ (subclone)")) %>%
+    dplyr::mutate(group = factor(group, levels = c("SRSF2+ / target-wt (founding)",
+                                                    "SRSF2+ / target+ (subclone)"))) %>%
+    dplyr::arrange(group)                                       # subclone (red) on top
+  pal <- c("SRSF2+ / target-wt (founding)" = FOUND,
+           "SRSF2+ / target+ (subclone)"   = SUB)
+  hl_umap(pt, hi, paste0(pt, " — SRSF2 + ", g),
+          sprintf("founding n=%d   subclone n=%d", length(cc$found), length(cc$sub)),
+          mode = "twocol", pal = pal) +
+    theme(legend.position = "bottom",
+          legend.text = element_text(size = 6), legend.key.height = unit(8, "pt"))
+}
+
+## ── BoneMarrowMap-style row: sample | founding | →gene | subclone ───────
+bmm_row <- function(pt, g) {
+  cc <- subclone_cells(pt, g); both <- union(cc$found, cc$sub)
+  pA <- hl_umap(pt, hi_coords(pt, both),  paste0(pt, " — SRSF2 + ", g),
+                sprintf("%d SRSF2+ cells genotyped for %s", length(both), g), "celltype")
+  pB <- hl_umap(pt, hi_coords(pt, cc$found), "Founding clone",
+                sprintf("SRSF2+ / %s-wt   (n=%d)", g, length(cc$found)), "celltype")
+  pC <- hl_umap(pt, hi_coords(pt, cc$sub),  "Subclone",
+                sprintf("SRSF2+ / %s+   (n=%d)", g, length(cc$sub)), "celltype")
+  arrow <- ggplot() + xlim(0,1) + ylim(0,1) + theme_void() +
+    annotate("segment", x=.12, xend=.88, y=.55, yend=.55,
+             arrow=grid::arrow(length=unit(6,"pt"), type="closed"),
+             linewidth=.6, colour="grey30") +
+    annotate("text", x=.5, y=.74, label=g, fontface="italic", colour=SUB, size=2.8)
+  (pA | pB | arrow | pC) + patchwork::plot_layout(widths = c(1,1,.4,1))
+}
+
+## ── cell-type composition bars: founding vs subclone ────────────────────
+comp_bar <- function(pt, g) {
+  cc <- subclone_cells(pt, g)
+  if (length(cc$found) < MIN_CLONE || length(cc$sub) < MIN_CLONE) return(NULL)
+  df <- dplyr::bind_rows(
+    tibble::tibble(clone="founding", celltype=emb$celltype[match(cc$found, emb$bc)]),
+    tibble::tibble(clone="subclone", celltype=emb$celltype[match(cc$sub,   emb$bc)])) %>%
+    dplyr::filter(!is.na(celltype)) %>%
+    dplyr::count(clone, celltype) %>%
+    dplyr::group_by(clone) %>% dplyr::mutate(frac=n/sum(n)) %>% dplyr::ungroup() %>%
+    dplyr::mutate(clone=factor(clone, c("founding","subclone")))
+  ggplot(df, aes(clone, frac, fill=celltype)) +
+    geom_col(width=.75, colour="white", linewidth=.15) +
+    scale_fill_manual(values=CT_PAL, drop=FALSE, name="cell type") +
+    scale_y_continuous(expand=c(0,0)) +
+    labs(x=NULL, y="fraction", title=paste0(pt, " — SRSF2 + ", g)) +
+    theme_classic(base_size=7) +
+    theme(plot.title=element_text(face="bold", size=7.5),
+          axis.text.x=element_text(angle=20,hjust=1), legend.key.size=unit(7,"pt"))
+}
+
+## ═══════════════════════════════════════════════════════════════════════
+##  SUMMARY TABLE — one pass, native columns:
+##   composition shift (Fisher q, n-inflated) + TV distance (effect size, n-indep)
+##   TV = 0.5 * sum_celltypes |frac_sub - frac_found|   (0 identical … 1 disjoint)
+## ═══════════════════════════════════════════════════════════════════════
+summ <- purrr::map2_dfr(codrivers$patient, codrivers$gene, function(pt,g){
+  cc <- subclone_cells(pt,g)
+  ct_f <- emb$celltype[match(cc$found, emb$bc)]; ct_f <- ct_f[!is.na(ct_f)]
+  ct_s <- emb$celltype[match(cc$sub,   emb$bc)]; ct_s <- ct_s[!is.na(ct_s)]
+  lv   <- names(CT_PAL)
+  prim <- function(x) if(length(x)) mean(x %in% PRIMITIVE) else NA
+  ## Fisher on composition (does WHERE differ?) — n-inflated significance
+  p_comp <- NA_real_
+  if (length(ct_f)>=MIN_CLONE && length(ct_s)>=MIN_CLONE) {
+    tb <- table(factor(c(ct_f,ct_s), levels=lv),
+                rep(c("found","sub"), c(length(ct_f), length(ct_s))))
+    tb <- tb[rowSums(tb)>0,,drop=FALSE]
+    if (nrow(tb)>=2) p_comp <- fisher.test(tb, simulate.p.value=TRUE, B=1e4)$p.value
+  }
+  ## TV distance + which cell type the subclone gains most — n-independent effect size
+  tv <- NA_real_; top_shift <- NA_character_
+  if (length(ct_f) && length(ct_s)) {
+    ff <- prop.table(table(factor(ct_f, levels=lv)))
+    fs <- prop.table(table(factor(ct_s, levels=lv)))
+    d  <- as.numeric(fs - ff)
+    tv <- round(0.5*sum(abs(d)), 3)
+    top_shift <- sprintf("%s (+%.0f%%)", lv[which.max(d)], 100*max(d))
+  }
+  tibble::tibble(patient=pt, gene=g, n_genotyped_both=cc$n_both_genotyped,
+                 n_found=length(cc$found), n_sub=length(cc$sub),
+                 prim_found=round(prim(ct_f),2), prim_sub=round(prim(ct_s),2),
+                 d_prim=round(prim(ct_s)-prim(ct_f),2),
+                 tv=tv, top_shift=top_shift, p_comp=p_comp)
+}) %>%
+  dplyr::mutate(drawable = n_genotyped_both>=MIN_BOTH & n_found>=MIN_CLONE & n_sub>=MIN_CLONE,
+                q_comp   = p.adjust(p_comp, "BH")) %>%
+  dplyr::arrange(dplyr::desc(drawable), dplyr::desc(pmin(n_found,n_sub)))
+readr::write_tsv(summ, file.path(OUTDIR_SC, "subclone_localization_summary.tsv"))
+cat("Per-pair subclone summary (drawable = enough cells in BOTH groups):\n")
+print(as.data.frame(summ), row.names=FALSE)
+
+## ── DRIVER RANKING by TV distance (effect size), then significance ──────
+AML_DRIVERS <- c("NPM1","NPM1_indel","IDH1","IDH2","TET2","ASXL1","ASXL1_indel",
+                 "RUNX1","RUNX1_indel","STAG2","STAG2_indel","NRAS","KRAS",
+                 "FLT3","JAK2","CBL","CBL_indel","PTPN11","ETNK1","EZH2",
+                 "BCOR","PHF6","SETBP1","WT1","GATA2","KIT","CSNK1A1")
+ranked_tv <- summ %>% dplyr::filter(drawable) %>%
+  dplyr::mutate(driver = gene %in% AML_DRIVERS) %>%
+  dplyr::arrange(dplyr::desc(driver), dplyr::desc(tv))
+cat("\n=== canonical drivers ranked by TV distance (most different first) ===\n")
+print(as.data.frame(ranked_tv %>% dplyr::filter(driver) %>%
+  dplyr::select(patient, gene, n_found, n_sub, d_prim, tv, top_shift, q_comp)), row.names=FALSE)
+
+## ═══════════════════════════════════════════════════════════════════════
+##  FINAL FIGURE: 5 significant-driver pairs, ordered by TV (mover → non-mover)
+## ═══════════════════════════════════════════════════════════════════════
+choose <- tibble::tribble(
+  ~patient, ~gene,       ~note,
+  "P13",    "IDH1",      "TV 0.50 — subclone → HSC block (biggest effect; n=24, flag in caption)",
+  "P12",    "STAG2",     "TV 0.27 — reshuffles into HSCs (intra-primitive; well-powered)",
+  "P13",    "PTPN11",    "TV 0.25 — subclone → monocytic (opposite direction; well-powered)",
+  "P6",     "NPM1_indel","TV 0.11 — well-powered but largely co-localized",
+  "P16",    "IDH2",      "TV 0.09 — smallest significant mover (lineage reshuffle)")
+NP <- nrow(choose)
+
+umaps <- purrr::map2(choose$patient, choose$gene, overlay_umap)
+bars  <- purrr::map2(choose$patient, choose$gene, comp_bar)
+rows  <- purrr::map2(choose$patient, choose$gene, bmm_row)
+
+## (1) overlay UMAPs — founding blue vs subclone red (ncol=2 → 3 rows for 5)
+gU <- patchwork::wrap_plots(umaps, ncol=2)
+ggsave(file.path(OUTDIR_SC,"fig_subclone_overlay_5.pdf"), gU,
+       width=20, height=9*ceiling(NP/2), units="cm", limitsize=FALSE)
+ggsave(file.path(OUTDIR_SC,"fig_subclone_overlay_5.png"), gU,
+       width=20, height=9*ceiling(NP/2), units="cm", dpi=300, limitsize=FALSE)
+
+## (2) BoneMarrowMap-style rows — cell-type coloured, shared CT legend
+ct_leg <- cowplot::get_legend(
+  hl_umap(choose$patient[1], hi_coords(choose$patient[1],
+            subclone_cells(choose$patient[1], choose$gene[1])$found),
+          "", "", "celltype") +
+    theme(legend.position="right", legend.key.size=unit(8,"pt"),
+          legend.text=element_text(size=6.5)))
+gR     <- patchwork::wrap_plots(rows, ncol=1)
+gR_leg <- cowplot::plot_grid(gR, ct_leg, ncol=2, rel_widths=c(1,0.16))
+ggsave(file.path(OUTDIR_SC,"fig_subclone_bmmstyle_5.pdf"), gR_leg,
+       width=26, height=6.5*NP, units="cm", limitsize=FALSE)
+ggsave(file.path(OUTDIR_SC,"fig_subclone_bmmstyle_5.png"), gR_leg,
+       width=26, height=6.5*NP, units="cm", dpi=300, limitsize=FALSE)
+
+## (3) composition bars — founding vs subclone cell-type fractions
+gB <- patchwork::wrap_plots(bars, ncol=2, guides="collect")
+ggsave(file.path(OUTDIR_SC,"fig_subclone_compbars_5.pdf"), gB,
+       width=22, height=8*ceiling(NP/2), units="cm", limitsize=FALSE)
+ggsave(file.path(OUTDIR_SC,"fig_subclone_compbars_5.png"), gB,
+       width=22, height=8*ceiling(NP/2), units="cm", dpi=300, limitsize=FALSE)
+
+cat("\nDone — summary TSV + 3 figure variants (5-panel) in", OUTDIR_SC, "\n")
+```
+
+```{r clonal progression P12 and P13}
+## ═══════════════════════════════════════════════════════════════════════
+##  COMBINED CLONAL-PROGRESSION FIGURE — P12 (left box) + P13 (right box)
+##   left  : KLHL15+/SRSF2-wt --SRSF2--> KLHL15+/SRSF2+
+##           SRSF2+/STAG2-wt  --STAG2--> SRSF2+/STAG2+
+##   right : SRSF2+/PTPN11-wt --PTPN11-> SRSF2+/PTPN11+
+##           SRSF2+/IDH1-wt   --IDH1---> SRSF2+/IDH1+
+##  BoneMarrowMap style: all patient cells grey backdrop, genotype set on top
+##  coloured by cell type. One shared cell-type legend at the bottom.
+##  Uses: geno, emb, CT_PAL (setup chunk)
+## ═══════════════════════════════════════════════════════════════════════
+## ── CONFIG ──────────────────────────────────────────────────────────────
+GREY_BG <- "grey75"
+## ── helpers (geno, emb, CT_PAL: setup chunk) ─────────────────────────────
+resolve_gene <- function(pt, want) {
+  cand <- geno %>% dplyr::filter(patient==pt) %>% dplyr::distinct(gene) %>% dplyr::pull(gene)
+  hit  <- cand[cand==want]; if(!length(hit)) hit <- cand[grepl(paste0("^",want),cand,ignore.case=TRUE)]
+  if(!length(hit)) stop(sprintf("No gene matching '%s' in %s. Available: %s", want, pt, paste(cand,collapse=", ")))
+  hit[1]
+}
+bc_of <- function(pt,g,state) geno %>% dplyr::filter(patient==pt, gene==g, mutated==state) %>% dplyr::pull(bc)
+
+## ── highlight-on-grey UMAP (cell-type coloured), one genotype state ──────
+state_umap <- function(pt, bcs, title, subtitle) {
+  base <- emb %>% dplyr::filter(patient==pt)
+  hi   <- emb %>% dplyr::filter(patient==pt, bc %in% bcs)
+  ggplot() +
+    geom_point(data=base, aes(UMAP1,UMAP2), colour=GREY_BG, size=0.35, stroke=0, alpha=0.6) +
+    geom_point(data=hi,   aes(UMAP1,UMAP2, colour=celltype), size=1.4, stroke=0) +
+    scale_colour_manual(values=CT_PAL, drop=FALSE, name="cell type") +
+    coord_equal() + labs(title=title, subtitle=subtitle, x=NULL, y=NULL) +
+    theme_void(base_size=8) +
+    theme(plot.title=element_text(face="bold", size=8.5, hjust=.5),
+          plot.subtitle=element_text(size=6.5, colour="grey30", hjust=.5),
+          legend.position="none")
+}
+arrow_panel <- function(lab) ggplot() + xlim(0,1) + ylim(0,1) + theme_void() +
+  annotate("segment", x=.12, xend=.88, y=.5, yend=.5,
+           arrow=grid::arrow(length=unit(6,"pt"), type="closed"), linewidth=.6, colour="grey30") +
+  annotate("text", x=.5, y=.72, label=lab, fontface="italic", colour="#B2182B", size=3)
+
+## ── one transition row: pre | arrow | post ──────────────────────────────
+trans_row <- function(pt, pre_bc, post_bc, event, t_pre, s_pre, t_post, s_post) {
+  (state_umap(pt, pre_bc,  t_pre,  s_pre) |
+   arrow_panel(event) |
+   state_umap(pt, post_bc, t_post, s_post)) +
+    patchwork::plot_layout(widths=c(1,.38,1))
+}
+
+## ── resolve genes ────────────────────────────────────────────────────────
+KLHL15 <- resolve_gene("P12","KLHL15"); STAG2 <- resolve_gene("P12","STAG2")
+PTPN11 <- resolve_gene("P13","PTPN11"); IDH1  <- resolve_gene("P13","IDH1")
+
+## ── P12 block (left): two rows ──────────────────────────────────────────
+a_pre  <- intersect(bc_of("P12",KLHL15,"mutated"), bc_of("P12","SRSF2","wildtype"))
+a_post <- intersect(bc_of("P12",KLHL15,"mutated"), bc_of("P12","SRSF2","mutated"))
+b_pre  <- intersect(bc_of("P12","SRSF2","mutated"), bc_of("P12",STAG2,"wildtype"))
+b_post <- intersect(bc_of("P12","SRSF2","mutated"), bc_of("P12",STAG2,"mutated"))
+rowA <- trans_row("P12", a_pre, a_post, "SRSF2",
+  "Ancestral clone", sprintf("P12: KLHL15+ / SRSF2-wt (n=%d)", length(a_pre)),
+  "SRSF2 acquired",  sprintf("P12: KLHL15+ / SRSF2+ (n=%d)",   length(a_post)))
+rowB <- trans_row("P12", b_pre, b_post, "STAG2",
+  "SRSF2 acquired", sprintf("P12: SRSF2+ / STAG2-wt (n=%d)", length(b_pre)),
+  "STAG2 subclone", sprintf("P12: SRSF2+ / STAG2+ (n=%d)",   length(b_post)))
+blockP12 <- (rowA / rowB)
+
+## ── P13 block (right): two rows ─────────────────────────────────────────
+c_pre  <- intersect(bc_of("P13","SRSF2","mutated"), bc_of("P13",PTPN11,"wildtype"))
+c_post <- intersect(bc_of("P13","SRSF2","mutated"), bc_of("P13",PTPN11,"mutated"))
+d_pre  <- intersect(bc_of("P13","SRSF2","mutated"), bc_of("P13",IDH1,"wildtype"))
+d_post <- intersect(bc_of("P13","SRSF2","mutated"), bc_of("P13",IDH1,"mutated"))
+rowC <- trans_row("P13", c_pre, c_post, "PTPN11",
+  "SRSF2 founding clone", sprintf("P13: SRSF2+ / PTPN11-wt (n=%d)", length(c_pre)),
+  "PTPN11 subclone",      sprintf("P13: SRSF2+ / PTPN11+ (n=%d)",   length(c_post)))
+rowD <- trans_row("P13", d_pre, d_post, "IDH1",
+  "SRSF2 founding clone", sprintf("P13: SRSF2+ / IDH1-wt (n=%d)", length(d_pre)),
+  "IDH1 subclone",        sprintf("P13: SRSF2+ / IDH1+ (n=%d)",   length(d_post)))
+blockP13 <- (rowC / rowD)
+
+cat(sprintf("P12  a:%d->%d  b:%d->%d   |   P13  c:%d->%d  d:%d->%d\n",
+  length(a_pre),length(a_post),length(b_pre),length(b_post),
+  length(c_pre),length(c_post),length(d_pre),length(d_post)))
+
+## ── border box around each patient block ────────────────────────────────
+boxed <- function(p) patchwork::wrap_elements(full = p) +
+  theme(plot.background = element_rect(colour="black", fill=NA, linewidth=0.7))
+
+combined <- boxed(blockP12) | boxed(blockP13)
+
+## ── shared horizontal cell-type legend (built once) ─────────────────────
+ct_leg <- cowplot::get_legend(
+  state_umap("P12", a_post, "", "") +
+    theme(legend.position="bottom", legend.key.size=unit(8,"pt"),
+          legend.text=element_text(size=7), legend.title=element_text(size=7.5)) +
+    guides(colour=guide_legend(nrow=1, override.aes=list(size=2.4))))
+
+final <- cowplot::plot_grid(combined, ct_leg, ncol=1, rel_heights=c(1, 0.06))
+
+ggsave(file.path(OUTDIR_SC,"fig_progression_combined_P12_P13.pdf"), final,
+       width=34, height=17, units="cm", limitsize=FALSE)
+ggsave(file.path(OUTDIR_SC,"fig_progression_combined_P12_P13.png"), final,
+       width=34, height=17, units="cm", dpi=300, limitsize=FALSE)
+cat("\nSaved fig_progression_combined_P12_P13 to", OUTDIR_SC, "\n")
+```
+
+```{r subclone dissimilarity to founding clone (TV distance)}
+## ═══════════════════════════════════════════════════════════════════════
+##  PANEL D — cohort ranking of SRSF2 SUBCLONES by cell-type composition
+##  DISSIMILARITY to their SRSF2 founding-clone counterpart.
+##    metric = TV distance (0..1):  TV = 0.5 * sum_ct |frac_sub - frac_found|
+##           = fraction of subclone cells that must change cell type to
+##             match the founding clone's composition.
+##  A pair (SRSF2, X) is a SUBCLONE only if SRSF2 was acquired FIRST.
+##  Lesions that PRECEDE SRSF2 (ancestral) are hardcoded below and excluded.
+##  Keep pairs with >=20 cells in BOTH founding (SRSF2+/X-wt) and subclone (SRSF2+/X+).
+##  Asterisks = BH-adjusted Fisher q:  * <0.05  ** <0.01  *** <0.001
+##  Uses: geno, ct_of, subclone_cells (setup chunk)
+## ═══════════════════════════════════════════════════════════════════════
+MIN_CELLS <- 20                         # >=20 cells in BOTH groups (user threshold)
+SUB_RED   <- "#B2182B"
+CT_LV <- c("HSCs","GMPs","Lymphoid progenitors","MEPs","Erythroid-like cells","Monocytes",
+           "T-cells","B-cells","NK cells","Dendritic cells","Plasma cells","Stromal cells")
+
+## ── ANCESTRAL lesions (acquired BEFORE SRSF2) — NOT SRSF2 subclones, exclude ──
+ANCESTRAL <- tibble::tribble(
+  ~patient, ~gene,
+  "P12", "KLHL15",
+  "P12", "PLBD1",
+  "P4",  "STAG2_indel",
+  "P14", "IDH2",
+  "P17", "TOP1MT")
+
+## ── candidate co-drivers: co-genotyped with SRSF2, MINUS ancestral lesions ──
+gene_n    <- geno %>% dplyr::count(patient, gene, name="n_inf")
+codrivers <- gene_n %>% dplyr::filter(gene!="SRSF2") %>%
+  dplyr::semi_join(dplyr::filter(gene_n, gene=="SRSF2"), by="patient") %>%
+  dplyr::select(patient, gene) %>%
+  dplyr::anti_join(ANCESTRAL, by=c("patient","gene"))      # drop pre-SRSF2 lesions
+
+## ── TV distance (dissimilarity) + Fisher q for every subclone pair ──────
+rank_tbl <- purrr::map2_dfr(codrivers$patient, codrivers$gene, function(pt,g){
+  cc <- subclone_cells(pt,g)
+  ct_f <- ct_of[cc$found]; ct_f <- ct_f[!is.na(ct_f)]
+  ct_s <- ct_of[cc$sub];   ct_s <- ct_s[!is.na(ct_s)]
+  n_f <- length(ct_f); n_s <- length(ct_s)
+  tv <- NA_real_; q_raw <- NA_real_; top <- NA_character_
+  if (n_f>=MIN_CELLS && n_s>=MIN_CELLS) {
+    ff <- prop.table(table(factor(ct_f, levels=CT_LV)))
+    fs <- prop.table(table(factor(ct_s, levels=CT_LV)))
+    d  <- as.numeric(fs - ff); tv <- 0.5*sum(abs(d)); top <- CT_LV[which.max(d)]
+    tb <- table(factor(c(ct_f,ct_s), levels=CT_LV),
+                rep(c("f","s"), c(n_f,n_s))); tb <- tb[rowSums(tb)>0,,drop=FALSE]
+    if (nrow(tb)>=2) q_raw <- fisher.test(tb, simulate.p.value=TRUE, B=1e4)$p.value
+  }
+  tibble::tibble(patient=pt, gene=g, n_found=n_f, n_sub=n_s, tv=tv,
+                 gained=top, p_comp=q_raw)
+}) %>%
+  dplyr::filter(!is.na(tv)) %>%
+  dplyr::mutate(q_comp = p.adjust(p_comp, "BH"),
+                sig    = !is.na(q_comp) & q_comp < 0.05,
+                stars  = dplyr::case_when(
+                           is.na(q_comp)  ~ "",
+                           q_comp < 0.001 ~ "***",
+                           q_comp < 0.01  ~ "**",
+                           q_comp < 0.05  ~ "*",
+                           TRUE           ~ ""),
+                label  = paste0(patient, ": ", gene)) %>%
+  dplyr::arrange(dplyr::desc(tv))
+
+readr::write_tsv(rank_tbl, file.path(OUTDIR_SC, "subclone_dissimilarity_ranking.tsv"))
+cat(sprintf("SRSF2 subclones with >=%d cells in both groups (ancestral excluded): %d\n",
+            MIN_CELLS, nrow(rank_tbl)))
+cat(sprintf("Significant (q<0.05): %d\n", sum(rank_tbl$sig)))
+print(as.data.frame(rank_tbl %>% dplyr::select(label, n_found, n_sub, tv, gained, q_comp, stars)),
+      row.names=FALSE, digits=3)
+
+## ── barplot: x = subclone (ranked by TV), y = dissimilarity to founding ──
+pd <- rank_tbl %>% dplyr::mutate(label = forcats::fct_reorder(label, tv, .desc=TRUE))
+pD <- ggplot(pd, aes(x=label, y=tv, fill=tv)) +
+  geom_col(aes(colour=sig), width=.78, linewidth=.4) +
+  geom_text(aes(label=stars), vjust=0, nudge_y=0.012, size=2.6, colour="black") +
+  scale_fill_gradient(low="grey85", high=SUB_RED, name="dissimilarity", limits=c(0,NA)) +
+  scale_colour_manual(values=c(`TRUE`="black", `FALSE`=NA), guide="none") +
+  scale_y_continuous(expand=expansion(mult=c(0,.09))) +   # headroom for the *** stars
+  labs(x=NULL, y="composition dissimilarity to founding clone (TV)") +
+  theme_classic(base_size=8) +
+  theme(axis.text.x = element_text(angle=55, hjust=1, size=6),
+        axis.title.y = element_text(size=7.5),
+        legend.position = "none",
+        plot.margin = margin(4,4,4,4))
+ggsave(file.path(OUTDIR_SC,"fig_panelD_subclone_dissimilarity.pdf"), pD, width=22, height=6, units="cm")
+ggsave(file.path(OUTDIR_SC,"fig_panelD_subclone_dissimilarity.png"), pD, width=22, height=6, units="cm", dpi=300)
+cat("\nSaved Panel D dissimilarity ranking to", OUTDIR_SC, "\n")
+```
+
+```{r differentiation direction of significant subclones}
+## ═══════════════════════════════════════════════════════════════════════
+##  PANEL E — differentiation direction of each SRSF2 subclone
+##   Δprimitive = (subclone primitive frac) − (founding primitive frac)
+##   >0: subclone more primitive (block);  <0: more mature
+##  Uses: ct_of, subclone_cells (setup); codrivers, rank_tbl (panel D chunk)
+## ═══════════════════════════════════════════════════════════════════════
+PRIMITIVE <- c("HSCs","GMPs","MEPs","Lymphoid progenitors")
+UP_COL <- "#6a3d9a"   # toward primitive (block)   — purple
+DN_COL <- "#1b7837"   # toward mature              — green
+
+dprim_tbl <- purrr::map2_dfr(codrivers$patient, codrivers$gene, function(pt,g){
+  cc <- subclone_cells(pt,g)
+  ct_f <- ct_of[cc$found]; ct_f <- ct_f[!is.na(ct_f)]
+  ct_s <- ct_of[cc$sub];   ct_s <- ct_s[!is.na(ct_s)]
+  tibble::tibble(patient=pt, gene=g,
+                 d_prim = mean(ct_s %in% PRIMITIVE) - mean(ct_f %in% PRIMITIVE),
+                 label  = paste0(patient, ": ", gene))
+})
+
+## keep only significant subclones (the 11), carry direction
+pe <- rank_tbl %>% dplyr::filter(sig) %>%
+  dplyr::left_join(dprim_tbl, by=c("patient","gene","label")) %>%
+  dplyr::mutate(dir   = ifelse(d_prim>=0, "more primitive", "more mature"),
+                label = forcats::fct_reorder(label, d_prim))
+
+pE <- ggplot(pe, aes(x=d_prim, y=label, fill=dir)) +
+  geom_col(width=.7) +
+  geom_vline(xintercept=0, linewidth=.3, colour="grey40") +
+  scale_fill_manual(values=c(`more primitive`=UP_COL, `more mature`=DN_COL), name=NULL) +
+  scale_x_continuous(expand=expansion(mult=.05)) +
+  labs(x="Δ primitive fraction\n(subclone − founding)", y=NULL) +
+  theme_classic(base_size=8) +
+  theme(axis.text.y = element_text(size=6),
+        axis.title.x = element_text(size=7),
+        legend.position = "bottom", legend.text=element_text(size=6),
+        legend.key.size = unit(7,"pt"))
+ggsave(file.path(OUTDIR_SC,"fig_panelE_diff_direction.pdf"), pE, width=7, height=6, units="cm")
+ggsave(file.path(OUTDIR_SC,"fig_panelE_diff_direction.png"), pE, width=7, height=6, units="cm", dpi=300)
+
+cat("Panel E — Δprimitive by significant subclone:\n")
+print(as.data.frame(pe %>% dplyr::arrange(dplyr::desc(d_prim)) %>%
+        dplyr::select(label, tv, d_prim, gained)), row.names=FALSE, digits=3)
+```
+
+```{r DE subclone vs founding clone}
+## ═══════════════════════════════════════════════════════════════════════
+##  SUBCLONE vs FOUNDING clone DIFFERENTIAL EXPRESSION (within patient)
+##  ident.1 = subclone (SRSF2+/target+)   ident.2 = founding (SRSF2+/target-)
+##  +log2FC = UP in subclone (induced by acquiring the 2nd driver).
+##  Two levels: (a) global; (b) within each shared cell type (composition-controlled).
+##  Uses: subclone_cells, obj, ct_of, FOUND, SUB, OUTDIR_DE (setup chunk)
+## ═══════════════════════════════════════════════════════════════════════
+## ── config ──────────────────────────────────────────────────────────────
+DE_ASSAY     <- "RNA"      # <-- if your normalized data is SCT, set "SCT" (handled below)
+DefaultAssay(obj) <- DE_ASSAY
+obj <- SeuratObject::JoinLayers(obj) 
+DE_TEST      <- "wilcox"   # robust default; "MAST" also fine if installed
+MIN_DE_CELLS <- 20         # min cells per group for any comparison
+LFC_THR      <- 0.25       # report threshold
+PADJ_THR     <- 0.05
+de_pairs <- tibble::tribble(~patient, ~gene,
+  "P6","NPM1_indel",     # co-localized  -> global DE is clean
+  "P12","STAG2",         # mover (->HSCs) -> within-celltype is the headline
+  "P13","PTPN11")        # mover (->mono) -> within-celltype is the headline
+
+DefaultAssay(obj) <- DE_ASSAY
+if (DE_ASSAY == "SCT") obj <- PrepSCTFindMarkers(obj)   # required for SCT-based DE
+
+## ── one founding-vs-subclone test on given cell sets ────────────────────
+de_run <- function(cells_sub, cells_found, comparison) {
+  cells_sub   <- cells_sub[cells_sub     %in% colnames(obj)]
+  cells_found <- cells_found[cells_found %in% colnames(obj)]
+  if (length(cells_sub) < MIN_DE_CELLS || length(cells_found) < MIN_DE_CELLS) return(NULL)
+  m <- tryCatch(
+    FindMarkers(obj, ident.1=cells_sub, ident.2=cells_found,
+                assay=DE_ASSAY, slot="data", test.use=DE_TEST,
+                logfc.threshold=0.1, min.pct=0.1, verbose=FALSE),
+    error=function(e) NULL)
+  if (is.null(m) || !nrow(m)) return(NULL)
+  m$gene <- rownames(m); m$comparison <- comparison
+  m$n_sub <- length(cells_sub); m$n_found <- length(cells_found)
+  tibble::as_tibble(m)
+}
+
+## ── run global + within-celltype for one pair ───────────────────────────
+de_pair <- function(pt, g) {
+  cc <- subclone_cells(pt, g); sub <- cc$sub; fnd <- cc$found
+  out <- list(de_run(sub, fnd, "global"))
+  ## shared cell types with enough cells in BOTH clones
+  tf <- table(ct_of[fnd]); ts <- table(ct_of[sub])
+  shared <- intersect(names(tf[tf>=MIN_DE_CELLS]), names(ts[ts>=MIN_DE_CELLS]))
+  for (ct in shared)
+    out <- c(out, list(de_run(sub[ct_of[sub]==ct], fnd[ct_of[fnd]==ct], ct)))
+  res <- dplyr::bind_rows(purrr::compact(out))
+  if (nrow(res)) { res$patient <- pt; res$gene_pair <- g }
+  res
+}
+
+de_all <- purrr::map2_dfr(de_pairs$patient, de_pairs$gene, de_pair)
+readr::write_tsv(de_all, file.path(OUTDIR_DE, "subclone_vs_founding_DE.tsv"))
+
+## ── per-comparison significant-gene counts ──────────────────────────────
+sig_tab <- de_all %>%
+  dplyr::mutate(sig = p_val_adj < PADJ_THR & abs(avg_log2FC) >= LFC_THR) %>%
+  dplyr::group_by(patient, gene_pair, comparison, n_sub, n_found) %>%
+  dplyr::summarise(n_sig = sum(sig),
+                   up_sub  = sum(sig & avg_log2FC>0),
+                   up_fnd  = sum(sig & avg_log2FC<0), .groups="drop") %>%
+  dplyr::arrange(patient, gene_pair, dplyr::desc(comparison=="global"))
+cat("=== significant genes per comparison (padj<0.05, |lfc|>=0.25) ===\n")
+print(as.data.frame(sig_tab), row.names=FALSE)
+
+## ── volcano (one per comparison), palette-threaded ──────────────────────
+DROP_RE <- "^(RP[LS]|MT-|MRPL|MRPS|HB[AB])"   # hide housekeeping from LABELS (kept in table)
+volcano <- function(df, ttl) {
+  df <- df %>% dplyr::mutate(
+    dir = dplyr::case_when(p_val_adj<PADJ_THR & avg_log2FC>=LFC_THR ~ "up in subclone",
+                           p_val_adj<PADJ_THR & avg_log2FC<=-LFC_THR ~ "up in founding",
+                           TRUE ~ "n.s."),
+    lab = ifelse(dir!="n.s." & !grepl(DROP_RE, gene), gene, NA))
+  top <- df %>% dplyr::filter(!is.na(lab)) %>%
+    dplyr::slice_min(p_val_adj, n=12) %>% dplyr::pull(gene)
+  df$lab[!(df$gene %in% top)] <- NA
+  ggplot(df, aes(avg_log2FC, -log10(p_val_adj+1e-300), colour=dir)) +
+    geom_point(size=.5, stroke=0) +
+    ggrepel::geom_text_repel(aes(label=lab), size=2.2, max.overlaps=Inf, seed=1, colour="grey15") +
+    scale_colour_manual(values=c("up in subclone"=SUB,"up in founding"=FOUND,"n.s."="grey80"), name=NULL) +
+    geom_vline(xintercept=c(-LFC_THR,LFC_THR), linetype=3, linewidth=.3, colour="grey60") +
+    geom_hline(yintercept=-log10(PADJ_THR), linetype=3, linewidth=.3, colour="grey60") +
+    labs(title=ttl, x="log2FC (subclone / founding)", y="-log10 adj.p") +
+    theme_classic(base_size=8) +
+    theme(plot.title=element_text(face="bold", size=8), legend.position="bottom",
+          legend.text=element_text(size=6))
+}
+## render global + the within-celltype panel for each pair
+for (i in seq_len(nrow(de_pairs))) {
+  pt <- de_pairs$patient[i]; g <- de_pairs$gene[i]
+  sub <- dplyr::filter(de_all, patient==pt, gene_pair==g)
+  comps <- unique(sub$comparison)
+  ps <- lapply(comps, function(cp) volcano(dplyr::filter(sub, comparison==cp),
+                                           sprintf("%s SRSF2+%s — %s", pt, g, cp)))
+  gg <- patchwork::wrap_plots(ps, ncol=min(3,length(ps)))
+  ggsave(file.path(OUTDIR_DE, sprintf("volcano_%s_%s.png", pt, g)), gg,
+         width=8*min(3,length(ps)), height=8*ceiling(length(ps)/3), units="cm", dpi=300, limitsize=FALSE)
+}
+cat("\nDone — DE table + volcanoes in", OUTDIR_DE, "\n")
+```
+
+```{r HSC volcanoes}
+## ═══════════════════════════════════════════════════════════════════════
+##  HSC VOLCANOES — housekeeping excluded, |log2FC| >= 0.5 (3 pairs stacked, 7 x 19 cm)
+##  Reuses: de_all, SUB, FOUND, OUTDIR_DE   (no FindMarkers re-run)
+## ═══════════════════════════════════════════════════════════════════════
+HK_RE <- paste0("^(RP[LS]\\d|RPL|RPS|MRPL|MRPS|MT-|MTRNR|HB[AB])")                    
+LFC2     <- 0.5
+PADJ_THR <- 0.05
+hsc_pairs <- tibble::tribble(~patient, ~gene_pair,
+  "P6","NPM1_indel", "P13","PTPN11", "P12","STAG2")
+
+## ── volcano on housekeeping-excluded data, thresholded at LFC2 ───────────
+volcano2 <- function(df, ttl) {
+  df <- df %>% dplyr::filter(!grepl(HK_RE, gene)) %>%     # drop HK from points AND counts
+    dplyr::mutate(
+      dir = dplyr::case_when(
+        p_val_adj < PADJ_THR & avg_log2FC >=  LFC2 ~ "up in subclone",
+        p_val_adj < PADJ_THR & avg_log2FC <= -LFC2 ~ "up in founding",
+        TRUE ~ "n.s."),
+      lab = ifelse(dir!="n.s.", gene, NA))
+  ## label the 12 most significant non-n.s. genes
+  top <- df %>% dplyr::filter(!is.na(lab)) %>%
+    dplyr::slice_min(p_val_adj, n=12) %>% dplyr::pull(gene)
+  df$lab[!(df$gene %in% top)] <- NA
+  ggplot(df, aes(avg_log2FC, -log10(p_val_adj + 1e-300), colour=dir)) +
+    geom_point(size=.5, stroke=0) +
+    ggrepel::geom_text_repel(aes(label=lab), size=2.2, max.overlaps=Inf,
+                             seed=1, colour="grey15") +
+    scale_colour_manual(values=c("up in subclone"=SUB, "up in founding"=FOUND,
+                                 "n.s."="grey80"), name=NULL) +
+    geom_vline(xintercept=c(-LFC2, LFC2), linetype=3, linewidth=.3, colour="grey60") +
+    geom_hline(yintercept=-log10(PADJ_THR), linetype=3, linewidth=.3, colour="grey60") +
+    labs(title=ttl, x="log2FC (subclone / founding)", y="-log10 adj.p") +
+    theme_classic(base_size=8) +
+    theme(plot.title=element_text(face="bold", size=8),
+          legend.position="bottom", legend.text=element_text(size=6))
+}
+
+## ── honest counts + specific gene lists ─────────────────────────────────
+sig2 <- de_all %>%
+  dplyr::filter(comparison=="HSCs", !grepl(HK_RE, gene)) %>%
+  dplyr::mutate(sig = p_val_adj < PADJ_THR & abs(avg_log2FC) >= LFC2) %>%
+  dplyr::group_by(patient, gene_pair) %>%
+  dplyr::summarise(n_sig = sum(sig),
+                   up_sub = sum(sig & avg_log2FC>0),
+                   up_fnd = sum(sig & avg_log2FC<0), .groups="drop")
+cat("=== HSC DE, housekeeping-excluded, |log2FC|>=0.5 ===\n")
+print(as.data.frame(sig2), row.names=FALSE)
+
+for (i in seq_len(nrow(hsc_pairs))) {
+  pt <- hsc_pairs$patient[i]; g <- hsc_pairs$gene_pair[i]
+  df <- dplyr::filter(de_all, patient==pt, gene_pair==g, comparison=="HSCs",
+                      !grepl(HK_RE, gene), p_val_adj < PADJ_THR, abs(avg_log2FC) >= LFC2) %>%
+    dplyr::arrange(dplyr::desc(avg_log2FC)) %>%
+    dplyr::select(gene, avg_log2FC, p_val_adj, pct.1, pct.2)
+  cat(sprintf("\n=== %s SRSF2+%s — HSC, specific genes (|lfc|>=0.5) ===\n", pt, g))
+  print(as.data.frame(df), row.names=FALSE)
+}
+
+## ── stacked HSC volcanoes: 3 rows, 7 cm × 19 cm, no title/subtitle ───────
+hsc_volc <- lapply(seq_len(nrow(hsc_pairs)), function(i) {
+  pt <- hsc_pairs$patient[i]; g <- hsc_pairs$gene_pair[i]
+  df <- dplyr::filter(de_all, patient==pt, gene_pair==g, comparison=="HSCs")
+  ns <- df %>% dplyr::filter(!grepl(HK_RE, gene),
+                             p_val_adj < PADJ_THR, abs(avg_log2FC) >= LFC2) %>% nrow()
+  volcano2(df, sprintf("%s  SRSF2+%s  —  HSCs (%d sig)", pt, g, ns)) +
+    theme(legend.position = "none")          # drop per-panel legends (collected once below)
+})
+
+## shared x-range across the 3 panels (HK-excluded)
+xr <- de_all %>% dplyr::filter(comparison=="HSCs", !grepl(HK_RE, gene)) %>%
+  dplyr::pull(avg_log2FC) %>% range(na.rm=TRUE)
+hsc_volc <- lapply(hsc_volc, function(p) p + coord_cartesian(xlim = xr))
+
+gV <- patchwork::wrap_plots(hsc_volc, ncol=1, guides="collect") &
+  theme(legend.position = "bottom", legend.text = element_text(size=6),
+        legend.key.size = unit(6, "pt"))
+
+ggsave(file.path(OUTDIR_DE,"volcano_HSCs_3pairs_stacked.pdf"), gV,
+       width=7, height=19, units="cm")
+ggsave(file.path(OUTDIR_DE,"volcano_HSCs_3pairs_stacked.png"), gV,
+       width=7, height=19, units="cm", dpi=300)
+cat("Saved volcano_HSCs_3pairs_stacked.png/pdf (7×19 cm) to", OUTDIR_DE, "\n")
+```
+
+```{r GSEA barplots HSC}
+## ═══════════════════════════════════════════════════════════════════════
+##  PER-PAIR GSEA barplots — top N Hallmark terms, 3 panels stacked
+##  Uses: gsea_all, hsc_pairs, SUB, FOUND, OUTDIR_DE
+##  NOTE: gsea_all (Hallmark GSEA on the HSC DE results) is not created in this file yet
+## ═══════════════════════════════════════════════════════════════════════
+TOPN     <- 8       # terms per panel
+PADJ_SIG <- 0.05    # ring/label threshold
+
+## rank each pair's terms: by padj, then |NES| — keep the most robust hits
+one_gsea_bar <- function(pt, g) {
+  df <- gsea_all %>%
+    dplyr::filter(patient==pt, gene_pair==g, !is.na(NES)) %>%
+    dplyr::arrange(padj, dplyr::desc(abs(NES))) %>%
+    dplyr::slice_head(n=TOPN) %>%
+    dplyr::mutate(pathway = gsub("HALLMARK_","", pathway),
+                  pathway = gsub("_"," ", pathway),
+                  sig = padj < PADJ_SIG) %>%
+    dplyr::arrange(NES) %>%
+    dplyr::mutate(pathway = factor(pathway, levels=pathway))
+  ggplot(df, aes(NES, pathway, fill=NES)) +
+    geom_col(width=.7, colour=NA) +
+    ## outline bars that pass padj<0.05
+    geom_col(data=dplyr::filter(df, sig), width=.7, fill=NA,
+             colour="black", linewidth=.35) +
+    geom_vline(xintercept=0, linewidth=.3, colour="grey50") +
+    scale_fill_gradient2(low=FOUND, mid="grey90", high=SUB, midpoint=0, guide="none") +
+    labs(title=sprintf("%s  SRSF2+%s", pt, g), x="NES", y=NULL) +
+    theme_classic(base_size=7) +
+    theme(plot.title=element_text(face="bold", size=7.5),
+          axis.text.y=element_text(size=6), axis.text.x=element_text(size=6))
+}
+
+bars <- purrr::map2(hsc_pairs$patient, hsc_pairs$gene_pair, one_gsea_bar)
+gGb  <- patchwork::wrap_plots(bars, ncol=1)
+
+ggsave(file.path(OUTDIR_DE,"gsea_HSC_bars_stacked.pdf"), gGb, width=9, height=19, units="cm", limitsize=FALSE)
+ggsave(file.path(OUTDIR_DE,"gsea_HSC_bars_stacked.png"), gGb, width=9, height=19, units="cm", dpi=300, limitsize=FALSE)
+cat("Saved gsea_HSC_bars_stacked.png/pdf (9×19 cm) to", OUTDIR_DE, "\n")
+```
