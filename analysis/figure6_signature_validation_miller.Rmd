@@ -1,0 +1,260 @@
+---
+title: "Figure 6 - HSC signature validation in Miller et al. (long-read bulk RNA-seq)"
+output: html_document
+---
+
+```{r setup}
+## ============================================================
+## SRSF2 HSC signature validation — long-read bulk RNA-seq
+## Transcript -> gene collapsing + UP/DOWN signature scoring
+## Controls: myeloid only (CD34, Mono, PMN, Pros); CD19/CD3 excluded
+## ============================================================
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(EnsDb.Hsapiens.v86)
+  library(ggplot2)
+  library(ggpubr)
+  library(pROC)
+})
+
+## =========================================================
+## Paths
+##   aml_data.txt: transcript-level expression matrix (TPM) of Miller et al.
+##   aml_data.gtf: matching transcript annotation (ESPRESSO)
+## =========================================================
+PROJECT_DIR <- "/path/to/project"
+EXPR_FILE   <- file.path(PROJECT_DIR, "input/miller_et_al/aml_data.txt")
+GTF_FILE    <- file.path(PROJECT_DIR, "input/miller_et_al/aml_data.gtf")
+OUT_DIR     <- file.path(PROJECT_DIR, "plots/figure6_validation")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+## HSC signature (figure6_srsf2_hsc_signature_analysis.Rmd)
+UP   <- c("IL1RAP", "F13A1", "PLD1", "CNKSR2", "PRKCD", "HOMER3", "CFD", "COL4A5", "ANKRD18B")
+DOWN <- c("AVP", "ALDH1A1", "CDH7", "TNFSF4", "SH3BP5", "ABI3BP")
+
+## healthy control columns of the expression matrix
+control_samples <- c(
+  "CD19-051023", "CD19-051723", "CD19-A213_1",
+  "CD3-051023",  "CD3-051723",  "CD3-A213_1",  "CD3-A231_1",
+  "CD34-051023", "CD34-051723", "CD34-A213_1", "CD34-RO03938_dn", "CD34-RO03958_dn",
+  "Mono-051023", "Mono-051723", "Mono-A213_1", "Mono-A231_1",
+  "PMN-051023",  "PMN-051723",  "PMN-A213-1",
+  "Pros-051023", "Pros-051723", "Pros-A213_1", "Pros-A231_1"
+)
+```
+
+```{r load data and collapse to genes}
+## ---------- 1. Transcript-level expression matrix ----------
+dat <- data.table::fread(EXPR_FILE, sep = "\t", header = TRUE)
+sample_cols <- colnames(dat)[-1]
+
+## ---------- 2. Transcript -> gene mapping from the GTF ----------
+gtf <- data.table::fread(
+  GTF_FILE, sep = "\t", header = FALSE,
+  col.names = c("seqname", "source", "feature", "start", "end",
+                "score", "strand", "frame", "attribute")
+)
+gtf[, transcript_id := sub('.*transcript_id "([^"]+)".*', "\\1", attribute)]
+gtf[, gene_id       := sub('.*gene_id "([^"]+)".*', "\\1", attribute)]
+tx2gene <- unique(gtf[, .(transcript_id, gene_id)])
+
+## ---------- 3. Collapse to gene level (sum TPM) ----------
+## ~27% of ESPRESSO (novel) transcripts lack a gene annotation in this GTF
+## and are dropped here; all annotated ENST transcripts map.
+dat_annot <- merge(dat, tx2gene, by.x = "transcript_ID", by.y = "transcript_id")
+gene_expr <- dat_annot[, lapply(.SD, sum), by = gene_id, .SDcols = sample_cols]
+
+gene_mat <- as.matrix(gene_expr[, ..sample_cols])
+rownames(gene_mat) <- gene_expr$gene_id
+
+## ---------- 4. ENSG -> gene symbol ----------
+gene_symbols <- ensembldb::select(
+  EnsDb.Hsapiens.v86::EnsDb.Hsapiens.v86,
+  keys = rownames(gene_mat), keytype = "GENEID",
+  columns = c("GENEID", "SYMBOL")
+)
+gene_symbols <- gene_symbols[!duplicated(gene_symbols$GENEID), ]
+rownames(gene_symbols) <- gene_symbols$GENEID
+
+sym <- gene_symbols[rownames(gene_mat), "SYMBOL"]
+gene_mat_sym <- gene_mat[!is.na(sym), ]
+rownames(gene_mat_sym) <- sym[!is.na(sym)]
+gene_mat_sym <- gene_mat_sym[!duplicated(rownames(gene_mat_sym)), ]
+```
+
+```{r signature score}
+## ---------- 5. Per-sample signature score ----------
+## ABI3BP is not detected in this dataset and drops out of DOWN
+UP_present   <- intersect(UP,   rownames(gene_mat_sym))
+DOWN_present <- intersect(DOWN, rownames(gene_mat_sym))
+cat(sprintf("UP genes found: %d / %d; DOWN genes found: %d / %d\n",
+            length(UP_present), length(UP), length(DOWN_present), length(DOWN)))
+
+log_expr  <- log2(gene_mat_sym + 1)
+sig_score <- colMeans(log_expr[UP_present, , drop = FALSE]) -
+             colMeans(log_expr[DOWN_present, , drop = FALSE])
+
+## ---------- 6. Sample groups (myeloid controls only) ----------
+srsf2_samples           <- sample_cols[grepl("^SRSF2-", sample_cols)]
+control_samples_myeloid <- control_samples[!grepl("^CD19|^CD3-", control_samples)]
+
+compare_df <- data.frame(
+  sample    = colnames(gene_mat_sym),
+  sig_score = unname(sig_score)
+) %>%
+  dplyr::mutate(group = dplyr::case_when(
+    sample %in% srsf2_samples           ~ "SRSF2_mutant",
+    sample %in% control_samples_myeloid ~ "Healthy_control",
+    TRUE                                ~ "Other")) %>%
+  dplyr::filter(group %in% c("SRSF2_mutant", "Healthy_control")) %>%
+  ## recode sample names per cell type: CD34+_1..N, Monocytes_1..N, PMN_1..N,
+  ## Promyelocyte_1..N, SRSF2_1..N (sample_prefix is used for the per-celltype boxes)
+  dplyr::mutate(sample_prefix = dplyr::case_when(
+    grepl("^CD34",  sample) ~ "CD34+",
+    grepl("^Mono",  sample) ~ "Monocytes",
+    grepl("^PMN",   sample) ~ "PMN",
+    grepl("^Pro",   sample) ~ "Promyelocyte",
+    grepl("^SRSF2", sample) ~ "SRSF2",
+    TRUE                    ~ "Other")) %>%
+  dplyr::group_by(sample_prefix) %>%
+  dplyr::mutate(sample = paste0(sample_prefix, "_", dplyr::row_number())) %>%
+  dplyr::ungroup()
+
+print(table(compare_df$sample_prefix))
+```
+
+```{r stats}
+## ---------- 7. Normality check + Wilcoxon test ----------
+compare_df %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(shapiro_p = shapiro.test(sig_score)$p.value,
+                   median = median(sig_score), mean = mean(sig_score), n = dplyr::n())
+
+wilcox.test(sig_score ~ group, data = compare_df)
+```
+
+```{r plots}
+# ============================================================
+# Colors — healthy subtypes in blue/green shades, SRSF2 in red,
+# pooled "All Healthy" in grey
+# ============================================================
+celltype_colors <- c(
+  "CD34+"        = "#3B7FB6",
+  "Monocytes"    = "#56B4E9",
+  "PMN"          = "#009E73",
+  "Promyelocyte" = "#8DA0CB",
+  "All_Healthy"  = "grey55",
+  "SRSF2"        = "#d24163"
+)
+group_colors <- c("Healthy_control" = "#3B7FB6", "SRSF2_mutant" = "#d24163")
+
+theme_pub <- theme_classic(base_size = 10) +
+  theme(
+    axis.text         = element_text(colour = "black", size = 8.5),
+    axis.title        = element_text(size = 9.5),
+    axis.ticks        = element_line(colour = "black"),
+    axis.line         = element_line(colour = "black", linewidth = 0.4),
+    plot.title        = element_blank(),
+    legend.key        = element_blank(),
+    legend.background = element_blank(),
+    legend.position   = "none"
+  )
+
+# ============================================================
+# 1) Boxplot: one box per healthy cell type + pooled "All_Healthy",
+#    each tested against SRSF2
+# ============================================================
+box_df <- dplyr::bind_rows(
+  compare_df %>%
+    dplyr::mutate(celltype_group = ifelse(group == "SRSF2_mutant", "SRSF2", sample_prefix)),
+  compare_df %>%
+    dplyr::filter(group == "Healthy_control") %>%
+    dplyr::mutate(celltype_group = "All_Healthy")
+) %>%
+  dplyr::mutate(celltype_group = factor(
+    celltype_group,
+    levels = c("CD34+", "Monocytes", "PMN", "Promyelocyte", "All_Healthy", "SRSF2")))
+
+comparisons_list <- list(
+  c("CD34+", "SRSF2"),
+  c("Monocytes", "SRSF2"),
+  c("PMN", "SRSF2"),
+  c("Promyelocyte", "SRSF2"),
+  c("All_Healthy", "SRSF2")
+)
+
+p_box <- ggplot(box_df, aes(x = celltype_group, y = sig_score, fill = celltype_group)) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3, width = 0.6, alpha = 0.85) +
+  geom_point(size = 1.3, shape = 21, color = "black", stroke = 0.2,
+             position = position_jitter(width = 0.12, seed = 1)) +
+  ggpubr::stat_compare_means(
+    comparisons   = comparisons_list,
+    method        = "wilcox.test",
+    label         = "p.format",
+    size          = 2.2,
+    step.increase = 0.1,
+    tip.length    = 0.01
+  ) +
+  scale_fill_manual(values = celltype_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.35))) +
+  labs(y = "SIG score (UP - DOWN, log2 TPM)", x = NULL) +
+  theme_pub +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+
+ggsave(file.path(OUT_DIR, "Miller_SIG_score_boxplot.pdf"),
+       p_box, width = 11, height = 8, units = "cm")
+ggsave(file.path(OUT_DIR, "Miller_SIG_score_boxplot.png"),
+       p_box, width = 11, height = 8, units = "cm", dpi = 300, bg = "white")
+
+# ============================================================
+# 2) Per-sample barplot, ordered by score
+# ============================================================
+compare_df_ord <- compare_df %>%
+  dplyr::arrange(sig_score) %>%
+  dplyr::mutate(sample = factor(sample, levels = sample))
+
+p_bar <- ggplot(compare_df_ord, aes(x = sample, y = sig_score, fill = group)) +
+  geom_col(width = 0.7, linewidth = 0.2, color = "black") +
+  scale_fill_manual(values = group_colors) +
+  labs(y = "SIG score (UP - DOWN, log2 TPM)", x = NULL, fill = NULL) +
+  theme_pub +
+  theme(
+    axis.text.x     = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 5, color = "black"),
+    legend.position = "top",
+    legend.text     = element_text(size = 7),
+    legend.key.size = unit(0.35, "cm")
+  )
+
+ggsave(file.path(OUT_DIR, "Miller_SIG_score_barplot.pdf"),
+       p_bar, width = 11, height = 6, units = "cm")
+ggsave(file.path(OUT_DIR, "Miller_SIG_score_barplot.png"),
+       p_bar, width = 11, height = 6, units = "cm", dpi = 300, bg = "white")
+
+# ============================================================
+# 3) ROC curve (SRSF2 vs all myeloid controls)
+# ============================================================
+roc_obj <- pROC::roc(compare_df$group, compare_df$sig_score,
+                     levels = c("Healthy_control", "SRSF2_mutant"),
+                     quiet = TRUE, ci = TRUE)
+cat(sprintf("Miller bulk AUROC = %.3f (%.3f-%.3f)\n",
+            as.numeric(roc_obj$auc), roc_obj$ci[1], roc_obj$ci[3]))
+
+roc_df <- data.frame(fpr = 1 - roc_obj$specificities, tpr = roc_obj$sensitivities)
+
+p_roc <- ggplot(roc_df, aes(fpr, tpr)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey70") +
+  geom_path(colour = group_colors["SRSF2_mutant"], linewidth = 0.9) +
+  annotate("text", x = 0.5, y = 0.12, hjust = 0, size = 3,
+           label = sprintf("AUROC = %.3f\n(%.3f-%.3f)",
+                           as.numeric(roc_obj$auc), roc_obj$ci[1], roc_obj$ci[3])) +
+  labs(x = "False positive rate", y = "True positive rate",
+       title = "Bulk SRSF2 signature — ROC") +
+  coord_equal() + theme_pub +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 10))
+
+ggsave(file.path(OUT_DIR, "Miller_ROC.pdf"),
+       p_roc, width = 7, height = 6, units = "cm")
+ggsave(file.path(OUT_DIR, "Miller_ROC.png"),
+       p_roc, width = 7, height = 6, units = "cm", dpi = 300, bg = "white")
+```
