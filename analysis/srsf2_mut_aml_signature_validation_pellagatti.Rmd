@@ -1,5 +1,5 @@
 ---
-title: "Figure 6 - HSC signature validation in Pellagatti et al. (GSE114922)"
+title: "HSC signature validation in Pellagatti et al. (GSE114922)"
 output: html_document
 ---
 
