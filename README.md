@@ -19,12 +19,11 @@ Figure 6 ( [B](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [C](analysis/sr
 
 ## Supplementary Figures
 
-Supplementary Figure 1 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd) ) \
-Supplementary Figure 2 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd) ) \
-Supplementary Figure 3 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd) ) \
-Supplementary Figure 4 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd) ) \
-Supplementary Figure 5 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd) ) \
-Supplementary Figure 6 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd) )
+Supplementary Figure 2 ( [A](analysis/supplement.Rmd) | [B](analysis/nanoranger_benchmark.Rmd) | [C](analysis/supplement.Rmd) ) \
+Supplementary Figure 3 ( [A](analysis/srsf2_mut_aml_exploratory.Rmd) | [B](analysis/supplement.Rmd) | [C](analysis/supplement.Rmd) ) \
+Supplementary Figure 4 ( [A](analysis/supplement.Rmd) | [B](analysis/supplement.Rmd) ) \
+Supplementary Figure 5 ( [A](analysis/supplement.Rmd) ) \
+Supplementary Figure 6 ( [A](analysis/srsf2_mut_aml_signature_validation_miller.Rmd) | [B](analysis/srsf2_mut_aml_signature_validation_miller.Rmd) | [C](analysis/srsf2_mut_aml_signature_validation_miller.Rmd) )
 
 
 ## Data availability
