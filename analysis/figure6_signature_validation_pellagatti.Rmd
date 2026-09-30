@@ -1,0 +1,331 @@
+---
+title: "Figure 6 - HSC signature validation in Pellagatti et al. (GSE114922)"
+output: html_document
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggpubr)
+  library(ggrepel)
+  library(pROC)
+  library(GEOquery)
+  library(Biobase)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+})
+
+## =========================================================
+## Paths
+##   GSE114922_TPM_table.txt: supplementary file of GEO series GSE114922
+##   (Pellagatti et al., 2018; CD34+ cells of MDS patients and healthy controls)
+## =========================================================
+PROJECT_DIR <- "/path/to/project"
+TPM_FILE    <- file.path(PROJECT_DIR, "input/GSE114922/GSE114922_TPM_table.txt")
+OUT_DIR     <- file.path(PROJECT_DIR, "plots/figure6_validation")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+## HSC signature (figure6_srsf2_hsc_signature_analysis.Rmd)
+UP   <- c("IL1RAP", "F13A1", "PLD1", "CNKSR2", "PRKCD", "HOMER3", "CFD", "COL4A5", "ANKRD18B")
+DOWN <- c("AVP", "ALDH1A1", "CDH7", "TNFSF4", "SH3BP5", "ABI3BP")
+
+group_colors <- c("Healthy_control" = "#3B7FB6", "SRSF2_mutant" = "#d24163")
+```
+
+```{r load data and GEO metadata}
+# ============================================================
+# 0) TPM table
+# ============================================================
+tpm <- read.delim(TPM_FILE, check.names = FALSE)
+sample_cols <- setdiff(colnames(tpm), "ensembl_ID")
+
+# ============================================================
+# 1) Mutation and disease status from the GEO sample metadata.
+#    The series matrix also contains the MON/GRA/ERY fractions
+#    (131 samples in total), so restrict to the 90 CD34+ samples
+#    present in the TPM table.
+# ============================================================
+gse <- GEOquery::getGEO("GSE114922", GSEMatrix = TRUE, getGPL = FALSE)
+pdata <- if (is.list(gse)) {
+  dplyr::bind_rows(lapply(gse, Biobase::pData))
+} else {
+  Biobase::pData(gse)
+}
+
+group_map <- pdata %>%
+  dplyr::filter(title %in% sample_cols) %>%
+  dplyr::select(
+    sample_col     = title,
+    disease_status = `disease status:ch1`,
+    srsf2_status   = `srsf2 mutational status:ch1`,
+    sf3b1_status   = `sf3b1 mutational status:ch1`,
+    u2af1_status   = `u2af1 mutational status:ch1`,
+    zrsr2_status   = `zrsr2 mutational status:ch1`,
+    patient_id     = `patient id:ch1`
+  ) %>%
+  dplyr::mutate(
+    group = dplyr::case_when(
+      grepl("healthy|normal|control", disease_status, ignore.case = TRUE)   ~ "Healthy_control",
+      grepl("mutant|mut|yes|positive|^1$", srsf2_status, ignore.case = TRUE) ~ "SRSF2_mutant",
+      TRUE                                                                   ~ "Other_MDS"
+    )
+  )
+
+cat(sprintf("Matched %d / %d TPM sample columns to GEO metadata\n",
+            nrow(group_map), length(sample_cols)))
+print(table(group_map$group))
+
+## SRSF2-mutant vs healthy controls only; label samples SRSF2_1..N / Healthy_1..N
+group_map_use <- group_map %>%
+  dplyr::filter(group %in% c("SRSF2_mutant", "Healthy_control")) %>%
+  dplyr::mutate(prefix = ifelse(group == "SRSF2_mutant", "SRSF2", "Healthy")) %>%
+  dplyr::group_by(prefix) %>%
+  dplyr::mutate(sample = paste0(prefix, "_", dplyr::row_number())) %>%
+  dplyr::ungroup()
+
+cat(sprintf("Using %d SRSF2_mutant and %d Healthy_control samples\n",
+            sum(group_map_use$group == "SRSF2_mutant"),
+            sum(group_map_use$group == "Healthy_control")))
+```
+
+```{r signature score}
+# ============================================================
+# 2) Signature score = mean log2(TPM+1) of UP genes - mean of DOWN genes
+#    The TPM table is indexed by Ensembl gene IDs -> map symbols first
+# ============================================================
+symbol_to_ensembl <- function(symbols) {
+  mapped <- AnnotationDbi::mapIds(
+    org.Hs.eg.db::org.Hs.eg.db, keys = symbols, keytype = "SYMBOL",
+    column = "ENSEMBL", multiVals = "first"
+  )
+  mapped[!is.na(mapped)]
+}
+
+UP_ensembl   <- symbol_to_ensembl(UP)
+DOWN_ensembl <- symbol_to_ensembl(DOWN)
+
+tpm_mat <- as.matrix(tpm[, sample_cols])
+rownames(tpm_mat) <- sub("\\.\\d+$", "", tpm$ensembl_ID)   # strip Ensembl version suffixes
+log2tpm <- log2(tpm_mat + 1)
+
+up_present   <- intersect(UP_ensembl,   rownames(log2tpm))
+down_present <- intersect(DOWN_ensembl, rownames(log2tpm))
+cat(sprintf("UP genes found: %d / %d; DOWN genes found: %d / %d\n",
+            length(up_present), length(UP), length(down_present), length(DOWN)))
+stopifnot(length(up_present) > 0, length(down_present) > 0)
+
+sig_score_all <- colMeans(log2tpm[up_present, , drop = FALSE]) -
+                 colMeans(log2tpm[down_present, , drop = FALSE])
+
+compare_df <- group_map_use %>%
+  dplyr::mutate(sig_score = unname(sig_score_all[sample_col])) %>%
+  dplyr::select(sample_col, sample, group, sig_score)
+```
+
+```{r signature score plots}
+theme_pub <- theme_classic(base_size = 10) +
+  theme(
+    axis.text         = element_text(colour = "black", size = 8.5),
+    axis.title        = element_text(size = 9.5),
+    axis.ticks        = element_line(colour = "black"),
+    axis.line         = element_line(colour = "black", linewidth = 0.4),
+    plot.title        = element_blank(),
+    legend.key        = element_blank(),
+    legend.background = element_blank(),
+    legend.position   = "none"
+  )
+
+# ============================================================
+# 3) Boxplot (Healthy vs SRSF2-mutant, CD34+)
+# ============================================================
+p_box <- ggplot(compare_df, aes(x = group, y = sig_score, fill = group)) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3, width = 0.5, alpha = 0.85) +
+  geom_point(size = 1.6, shape = 21, color = "black", stroke = 0.2,
+             position = position_jitter(width = 0.12, seed = 1)) +
+  ggrepel::geom_text_repel(
+    aes(label = sample), size = 2.2, max.overlaps = Inf,
+    segment.size = 0.2, segment.color = "grey40",
+    box.padding = 0.4, point.padding = 0.3,
+    position = position_jitter(width = 0.12, seed = 1),
+    min.segment.length = 0
+  ) +
+  ggpubr::stat_compare_means(
+    method = "wilcox.test", label = "p.format",
+    size = 2.6, label.y = max(compare_df$sig_score) + 0.4
+  ) +
+  scale_fill_manual(values = group_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0.08, 0.15))) +
+  labs(y = "SIG score (UP - DOWN, log2 TPM)", x = NULL) +
+  theme_pub
+
+ggsave(file.path(OUT_DIR, "Pellagatti_CD34_SIG_score_boxplot.pdf"),
+       p_box, width = 8, height = 6, units = "cm")
+ggsave(file.path(OUT_DIR, "Pellagatti_CD34_SIG_score_boxplot.png"),
+       p_box, width = 8, height = 6, units = "cm", dpi = 300, bg = "white")
+
+# ============================================================
+# 4) Per-sample barplot, ordered by score
+# ============================================================
+compare_df_ord <- compare_df %>%
+  dplyr::arrange(sig_score) %>%
+  dplyr::mutate(sample = factor(sample, levels = sample))
+
+p_bar <- ggplot(compare_df_ord, aes(x = sample, y = sig_score, fill = group)) +
+  geom_col(width = 0.7, linewidth = 0.2, color = "black") +
+  scale_fill_manual(values = group_colors) +
+  labs(y = "SIG score (UP - DOWN, log2 TPM)", x = NULL, fill = NULL) +
+  theme_pub +
+  theme(
+    axis.text.x     = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 5, color = "black"),
+    legend.position = "top",
+    legend.text     = element_text(size = 7),
+    legend.key.size = unit(0.35, "cm")
+  )
+
+ggsave(file.path(OUT_DIR, "Pellagatti_CD34_SIG_score_barplot.pdf"),
+       p_bar, width = 12, height = 6, units = "cm")
+ggsave(file.path(OUT_DIR, "Pellagatti_CD34_SIG_score_barplot.png"),
+       p_bar, width = 12, height = 6, units = "cm", dpi = 300, bg = "white")
+
+# ============================================================
+# 5) ROC curve
+# ============================================================
+roc_obj <- pROC::roc(compare_df$group, compare_df$sig_score,
+                     levels = c("Healthy_control", "SRSF2_mutant"),
+                     quiet = TRUE, ci = TRUE)
+cat(sprintf("Pellagatti CD34+ AUROC = %.3f (%.3f-%.3f)\n",
+            as.numeric(roc_obj$auc), roc_obj$ci[1], roc_obj$ci[3]))
+
+roc_df <- data.frame(fpr = 1 - roc_obj$specificities, tpr = roc_obj$sensitivities)
+
+p_roc <- ggplot(roc_df, aes(fpr, tpr)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey70") +
+  geom_path(colour = group_colors["SRSF2_mutant"], linewidth = 0.9) +
+  annotate("text", x = 0.5, y = 0.12, hjust = 0, size = 3,
+           label = sprintf("AUROC = %.3f\n(%.3f-%.3f)",
+                           as.numeric(roc_obj$auc), roc_obj$ci[1], roc_obj$ci[3])) +
+  labs(x = "False positive rate", y = "True positive rate",
+       title = "Pellagatti CD34+ MDS — ROC") +
+  coord_equal() + theme_pub +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 10))
+
+ggsave(file.path(OUT_DIR, "Pellagatti_CD34_ROC.pdf"),
+       p_roc, width = 7, height = 6, units = "cm")
+ggsave(file.path(OUT_DIR, "Pellagatti_CD34_ROC.png"),
+       p_roc, width = 7, height = 6, units = "cm", dpi = 300, bg = "white")
+```
+
+```{r per-gene expression of the signature genes}
+COLS <- c(Healthy_control = "#3b6ea5", SRSF2_mutant = "#d24163")
+
+theme_gene <- theme_classic(base_size = 12) +
+  theme(axis.text        = element_text(colour = "black"),
+        axis.ticks       = element_line(colour = "black"),
+        strip.background = element_rect(fill = "grey92", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        plot.title       = element_text(face = "bold", hjust = 0.5))
+
+## --- gene table (symbol + direction, genes present only) ---
+sig_tab <- data.frame(
+  ensembl   = c(UP_ensembl, DOWN_ensembl),
+  gene      = c(names(UP_ensembl), names(DOWN_ensembl)),
+  direction = rep(c("UP", "DOWN"), c(length(UP_ensembl), length(DOWN_ensembl))),
+  stringsAsFactors = FALSE
+)
+sig_tab <- sig_tab[sig_tab$ensembl %in% rownames(log2tpm), ]
+sig_tab$direction <- factor(sig_tab$direction, levels = c("UP", "DOWN"))
+
+## --- samples ordered by signature score within group ---
+sample_tab <- compare_df %>%
+  dplyr::mutate(group = factor(group, levels = c("Healthy_control", "SRSF2_mutant"))) %>%
+  dplyr::arrange(group, sig_score)
+
+## --- long expression table ---
+m <- log2tpm[sig_tab$ensembl, sample_tab$sample_col, drop = FALSE]
+rownames(m) <- sig_tab$gene
+expr_long <- as.data.frame(as.table(m), stringsAsFactors = FALSE)
+names(expr_long) <- c("gene", "sample_col", "log2tpm")
+
+expr_long <- expr_long %>%
+  dplyr::left_join(sig_tab[, c("gene", "direction")], by = "gene") %>%
+  dplyr::left_join(sample_tab[, c("sample_col", "sample", "group")], by = "sample_col") %>%
+  dplyr::mutate(
+    gene   = factor(gene,   levels = sig_tab$gene),
+    sample = factor(sample, levels = sample_tab$sample)
+  )
+
+## --- per-gene statistics (Wilcoxon + AUROC) ---
+gene_stats <- expr_long %>%
+  dplyr::group_by(gene, direction) %>%
+  dplyr::summarise(
+    mean_SRSF2   = mean(log2tpm[group == "SRSF2_mutant"]),
+    mean_Healthy = mean(log2tpm[group == "Healthy_control"]),
+    delta        = mean_SRSF2 - mean_Healthy,
+    p_wilcox     = suppressWarnings(
+                     wilcox.test(log2tpm[group == "SRSF2_mutant"],
+                                 log2tpm[group == "Healthy_control"])$p.value),
+    auroc        = as.numeric(pROC::auc(pROC::roc(
+                     response  = as.integer(group == "SRSF2_mutant"),
+                     predictor = log2tpm, quiet = TRUE, direction = "<"))),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(padj = p.adjust(p_wilcox, method = "BH")) %>%
+  dplyr::arrange(direction, p_wilcox)
+
+print(as.data.frame(gene_stats %>% dplyr::mutate(dplyr::across(where(is.numeric), ~ signif(.x, 3)))))
+write.csv(gene_stats, file.path(OUT_DIR, "pergene_stats_pellagatti.csv"), row.names = FALSE)
+
+# ============================================================
+# 6) Heatmap: genes x samples, z-scored per gene
+# ============================================================
+hm <- expr_long %>%
+  dplyr::group_by(gene) %>%
+  dplyr::mutate(z = as.numeric(scale(log2tpm))) %>%
+  dplyr::ungroup()
+
+p_hm <- ggplot(hm, aes(sample, gene, fill = z)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  facet_grid(direction ~ group, scales = "free", space = "free") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, limits = c(-2, 2), oob = scales::squish,
+                       name = "z-score\n(log2 TPM)") +
+  scale_y_discrete(limits = rev(levels(hm$gene))) +
+  labs(x = NULL, y = NULL,
+       title = "HSC signature genes — per-sample expression (GSE114922)") +
+  theme_gene +
+  theme(axis.text.x   = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8),
+        axis.line     = element_blank(), axis.ticks = element_blank(),
+        panel.spacing = unit(0.15, "lines"))
+
+ggsave(file.path(OUT_DIR, "pergene_heatmap_pellagatti.png"), p_hm,
+       width = 7.5, height = 5.5, dpi = 300, bg = "white")
+
+# ============================================================
+# 7) Per-gene boxplots, one facet per gene
+# ============================================================
+lab_stats <- gene_stats %>%
+  dplyr::mutate(lab = sprintf("p = %.3g", p_wilcox)) %>%
+  dplyr::left_join(expr_long %>% dplyr::group_by(gene) %>%
+                     dplyr::summarise(ytop = max(log2tpm), .groups = "drop"), by = "gene")
+
+p_box_gene <- ggplot(expr_long, aes(group, log2tpm, fill = group)) +
+  geom_boxplot(width = 0.6, outlier.shape = NA, alpha = 0.85, linewidth = 0.3) +
+  geom_jitter(width = 0.15, height = 0, size = 1.1, shape = 21,
+              fill = "white", colour = "black", stroke = 0.3) +
+  geom_text(data = lab_stats, aes(x = 1.5, y = ytop, label = lab),
+            inherit.aes = FALSE, vjust = -0.4, size = 2.8) +
+  facet_wrap(~ gene + direction, scales = "free_y", ncol = 5,
+             labeller = labeller(.multi_line = FALSE)) +
+  scale_fill_manual(values = COLS, name = NULL,
+                    labels = c("Healthy control", "SRSF2-mutant")) +
+  scale_x_discrete(labels = c("Healthy", "SRSF2")) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.18))) +
+  labs(x = NULL, y = expression(log[2]*"(TPM + 1)"),
+       title = "HSC signature genes — expression by group (GSE114922)") +
+  theme_gene + theme(legend.position = "top")
+
+ggsave(file.path(OUT_DIR, "pergene_boxplots_pellagatti.png"), p_box_gene,
+       width = 11, height = 2.3 * ceiling(nrow(sig_tab) / 5) + 1, dpi = 300, bg = "white")
+```
