@@ -15,7 +15,7 @@ Figure 3 ( [B](analysis/srsf2_mut_aml_exploratory.Rmd) | [C](analysis/srsf2_mut_
 | [F](analysis/srsf2_mut_aml_exploratory.Rmd) | [G](analysis/srsf2_mut_aml_exploratory.Rmd) | [H](analysis/srsf2_mut_aml_exploratory.Rmd)) \
 Figure 4 ( [B](analysis/srsf2_mut_aml_clonal_architecture.Rmd) | [C](analysis/srsf2_mut_aml_clonal_architecture.Rmd) | [D](analysis/srsf2_mut_aml_clonal_architecture.Rmd)) \
 Figure 5 ( [A](analysis/srsf2_mut_aml_subclones.Rmd) | [B](analysis/srsf2_mut_aml_subclones.Rmd) | [C](analysis/srsf2_mut_aml_subclones.Rmd) | [D](analysis/srsf2_mut_aml_subclones.Rmd) | [E](analysis/srsf2_mut_aml_subclones.Rmd) | [F](analysis/srsf2_mut_aml_subclones.Rmd)) \
-Figure 6 ( [B](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [C](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [D](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [E](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [F](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [H](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [I](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd))
+Figure 6 ( [B](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [C](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [D](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [E](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [F](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [H](analysis/srsf2_mut_aml_signature_validation_pellagatti.Rmd) | [I](analysis/srsf2_mut_aml_signature_validation_pellagatti.Rmd))
 
 ## Supplementary Figures
 
