@@ -19,7 +19,12 @@ Figure 6 ( [B](analysis/srsf2_mut_aml_hsc_signature_plots.Rmd) | [C](analysis/sr
 
 ## Supplementary Figures
 
-Supplementary Figure 1 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd)  | [D](analysis/mtDNA_Mutation_Statistics.Rmd))
+Supplementary Figure 1 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd)) \
+Supplementary Figure 2 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd)) \
+Supplementary Figure 3 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd)) \
+Supplementary Figure 4 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd)) \
+Supplementary Figure 5 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd)) \
+Supplementary Figure 6 ( [A](analysis/Cohort_Characterisation_Metadata.Rmd) | [B](analysis/mtDNA_Mutation_Statistics.Rmd) | [C](analysis/mtDNA_Mutation_Statistics.Rmd))
 
 
 ## Data availability
