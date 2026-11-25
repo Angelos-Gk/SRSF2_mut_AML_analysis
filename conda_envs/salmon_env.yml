@@ -33,4 +33,3 @@ dependencies:
   - sysroot_linux-64=2.34
   - tzdata=2026c
   - zstd=1.5.7
-prefix: /data/cephfs-1/work/groups/penter/users/anga12_c/miniforge/envs/salmon_env
